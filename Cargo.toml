@@ -1,0 +1,66 @@
+[package]
+name = "tri"
+version = "0.1.0"
+edition = "2024"
+description = "A small Rust task queue for multi-node compute workloads"
+license = "MIT"
+
+[lib]
+name = "tri"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tri-server"
+path = "src/bin/tri-server.rs"
+
+[[bin]]
+name = "tri-client"
+path = "src/bin/tri-client.rs"
+
+[[bin]]
+name = "tri_sub"
+path = "src/bin/tri_sub.rs"
+
+[[bin]]
+name = "tri_ls"
+path = "src/bin/tri_ls.rs"
+
+[[bin]]
+name = "tri_stat"
+path = "src/bin/tri_stat.rs"
+
+[[bin]]
+name = "tri_log"
+path = "src/bin/tri_log.rs"
+
+[[bin]]
+name = "tri_del"
+path = "src/bin/tri_del.rs"
+
+[[bin]]
+name = "tri_node"
+path = "src/bin/tri_node.rs"
+
+[[bin]]
+name = "tri_top"
+path = "src/bin/tri_top.rs"
+
+[[bin]]
+name = "tri_clean"
+path = "src/bin/tri_clean.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+comfy-table = "7"
+crossterm = "0.28"
+owo-colors = "4"
+ratatui = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+

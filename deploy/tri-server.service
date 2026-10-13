@@ -1,0 +1,23 @@
+[Unit]
+Description=tri task queue server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=triuser
+Group=triuser
+RuntimeDirectory=tri
+StateDirectory=tri
+Environment=TRI_SOCKET=/run/tri/server.sock
+Environment=TRI_SERVER_ADDR=0.0.0.0:7400
+Environment=TRI_DATA_DIR=/srv/tri-data/tri
+Environment=TRI_DB=/var/lib/tri/tri.db
+ExecStart=/usr/local/bin/tri-server
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

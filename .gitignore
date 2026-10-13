@@ -1,0 +1,14 @@
+/target/
+/data/
+/scratch/
+/.test-runtime*/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sock
+.env
+.env.*
+*.log
+*.out
+*.err

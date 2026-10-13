@@ -1,0 +1,18 @@
+[Unit]
+Description=tri compute client on PRIMARY
+After=network-online.target tri-server.service
+Wants=network-online.target
+Requires=tri-server.service
+
+[Service]
+Type=simple
+User=triuser
+Group=triuser
+Environment=TRI_SERVER_ADDR=127.0.0.1:7400
+ExecStart=/usr/local/bin/tri-client --name primary --address 192.0.2.10 --cpus 8 --memory 16G --gpus 0 --scratch /var/tmp/tri-scratch
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
