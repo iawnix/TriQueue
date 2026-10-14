@@ -589,6 +589,15 @@ async fn stop_task_unit(unit: &str) -> Result<()> {
         status.success(),
         "systemctl could not stop task service {unit}"
     );
+    let status = Command::new("systemctl")
+        .args(["--user", "reset-failed", &unit])
+        .status()
+        .await
+        .with_context(|| format!("resetting task service {unit}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "systemctl could not reset task service {unit}"
+    );
     Ok(())
 }
 
