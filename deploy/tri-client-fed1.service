@@ -8,8 +8,8 @@ Requires=tri-server.service
 Type=simple
 User=iaw
 Group=iaw
-Environment=TRI_CLIENT_UNIT=tri-client-fed1.service
 Environment=TRI_SERVER_ADDR=127.0.0.1:7400
+Environment=TRI_NODE_GPU_DEVICES=/dev/nvidia0
 ExecStart=/usr/local/bin/tri-client --name fed1 --address 192.168.31.243 --cpus 24 --memory 31G --gpus 1 --scratch /home/iaw/scratch
 Restart=on-failure
 RestartSec=2

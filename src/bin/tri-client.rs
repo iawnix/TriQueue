@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep};
 use tri::client;
-use tri::model::{NodeHeartbeat, NodeRegistration, RunningTask, TaskId, TaskResult, TaskState};
+use tri::model::{
+    NodeHeartbeat, NodeRegistration, ObservedUnit, RunningTask, TaskId, TaskResult, TaskState,
+};
 use tri::protocol::{Request, Response};
 use tri::{init_logging, parse_bytes};
 
@@ -21,6 +23,8 @@ struct Args {
     memory: u64,
     #[arg(long, env = "TRI_NODE_GPUS", default_value_t = 0)]
     gpus: u32,
+    #[arg(long, env = "TRI_NODE_GPU_DEVICES", value_delimiter = ',')]
+    gpu_devices: Vec<String>,
     #[arg(long, env = "TRI_NODE_SCRATCH", default_value = "/tmp/tri-scratch")]
     scratch: String,
 }
@@ -48,6 +52,17 @@ async fn main() -> Result<()> {
     init_logging();
     let args = Args::parse();
     std::fs::create_dir_all(&args.scratch)?;
+    let gpu_devices = if args.gpu_devices.is_empty() {
+        (0..args.gpus)
+            .map(|index| format!("/dev/nvidia{index}"))
+            .collect()
+    } else {
+        args.gpu_devices.clone()
+    };
+    anyhow::ensure!(
+        gpu_devices.len() >= args.gpus as usize,
+        "TRI_NODE_GPU_DEVICES must list at least TRI_NODE_GPUS device paths"
+    );
     let registration = NodeRegistration {
         name: args.name.clone(),
         address: args.address.clone(),
@@ -55,6 +70,7 @@ async fn main() -> Result<()> {
         memory_bytes: args.memory,
         gpu_total: args.gpus,
         scratch: args.scratch.clone(),
+        gpu_devices: gpu_devices.clone(),
     };
 
     loop {
@@ -71,7 +87,9 @@ async fn main() -> Result<()> {
     }
 
     let mut running: HashMap<TaskId, LocalTask> = HashMap::new();
-    let client_unit = std::env::var("TRI_CLIENT_UNIT").ok();
+    if let Err(error) = reconcile_units(&args.name, &args.scratch, &mut running).await {
+        tracing::warn!(%error, "initial task reconciliation failed");
+    }
     let mut next_heartbeat = Instant::now();
     let mut next_registration = Instant::now() + Duration::from_secs(10);
     loop {
@@ -112,6 +130,11 @@ async fn main() -> Result<()> {
             {
                 Ok(Response::Ok) => {
                     next_registration = Instant::now() + Duration::from_secs(10);
+                    if let Err(error) =
+                        reconcile_units(&args.name, &args.scratch, &mut running).await
+                    {
+                        tracing::warn!(%error, "task reconciliation failed");
+                    }
                 }
                 Ok(other) => {
                     tracing::warn!(?other, "unexpected re-registration response");
@@ -165,7 +188,7 @@ async fn main() -> Result<()> {
                 &assignment.cpus,
                 &assignment.gpus,
                 &args.scratch,
-                client_unit.as_deref(),
+                &gpu_devices,
             )
             .await
             {
@@ -200,7 +223,7 @@ async fn spawn_task(
     cpus: &str,
     gpus: &str,
     scratch_root: &str,
-    client_unit: Option<&str>,
+    gpu_devices: &[String],
 ) -> Result<Option<LocalTask>> {
     if task.spec.command.is_empty() {
         let _ = client::tcp(&Request::Complete {
@@ -265,13 +288,8 @@ async fn spawn_task(
     if let Some(timeout) = task.spec.timeout_seconds {
         command.args(["--property", &format!("RuntimeMaxSec={timeout}")]);
     }
-    if let Some(client_unit) = client_unit {
-        command.args([
-            "--property",
-            &format!("BindsTo={client_unit}"),
-            "--property",
-            &format!("PartOf={client_unit}"),
-        ]);
+    if !cpus.is_empty() {
+        command.args(["--property", &format!("AllowedCPUs={cpus}")]);
     }
     if let Some(cwd) = &task.spec.cwd {
         command.args(["--setenv", &format!("TRI_JOB_CWD={cwd}")]);
@@ -288,6 +306,19 @@ async fn spawn_task(
         command.args(["--setenv", &format!("{key}={value}")]);
     }
     if !gpus.is_empty() {
+        command.args(["--property", "DevicePolicy=closed"]);
+        for device in standard_device_paths() {
+            command.args(["--property", &format!("DeviceAllow={device} rwm")]);
+        }
+        for device in gpu_support_device_paths() {
+            command.args(["--property", &format!("DeviceAllow={device} rwm")]);
+        }
+        for index in parse_resource_set(gpus) {
+            let device = gpu_devices
+                .get(index as usize)
+                .with_context(|| format!("no device path configured for GPU {index}"))?;
+            command.args(["--property", &format!("DeviceAllow={device} rwm")]);
+        }
         command.args([
             "--setenv",
             &format!("CUDA_VISIBLE_DEVICES={gpus}"),
@@ -323,6 +354,147 @@ async fn spawn_task(
         timeout_seconds: task.spec.timeout_seconds,
         scratch,
     }))
+}
+
+async fn reconcile_units(
+    node: &str,
+    scratch_root: &str,
+    running: &mut HashMap<TaskId, LocalTask>,
+) -> Result<()> {
+    let (units, mut stop) = list_task_units().await?;
+    let response = client::tcp(&Request::Reconcile {
+        node: node.to_owned(),
+        units,
+    })
+    .await?;
+    let Response::Reconciled {
+        adopt,
+        stop: server_stop,
+    } = response
+    else {
+        anyhow::bail!("unexpected task reconciliation response: {response:?}")
+    };
+    stop.extend(server_stop);
+    for unit in stop {
+        if let Err(error) = stop_task_unit(&unit).await {
+            tracing::warn!(%error, %unit, "failed to stop orphan task unit");
+        }
+    }
+    for task in adopt {
+        if running.contains_key(&task.id) {
+            continue;
+        }
+        let unit = format!("tri-task-{}-{}", task.id, task.attempt);
+        running.insert(task.id, local_task_from_task(&task, unit, scratch_root)?);
+    }
+    Ok(())
+}
+
+async fn list_task_units() -> Result<(Vec<ObservedUnit>, Vec<String>)> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "tri-task-*.service",
+        ])
+        .output()
+        .await
+        .context("listing tri task units")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "systemctl could not list task units: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut units = Vec::new();
+    let mut stop = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(unit) = line.split_whitespace().next() else {
+            continue;
+        };
+        let unit = unit.strip_suffix(".service").unwrap_or(unit);
+        if let Some((task_id, attempt)) = parse_task_unit(unit) {
+            units.push(ObservedUnit {
+                unit: unit.to_owned(),
+                task_id,
+                attempt,
+            });
+        } else {
+            stop.push(unit.to_owned());
+        }
+    }
+    Ok((units, stop))
+}
+
+fn parse_task_unit(unit: &str) -> Option<(TaskId, u32)> {
+    let suffix = unit.strip_prefix("tri-task-")?;
+    let (id, attempt) = suffix.rsplit_once('-')?;
+    Some((id.parse().ok()?, attempt.parse().ok()?))
+}
+
+fn local_task_from_task(
+    task: &tri::model::Task,
+    unit: String,
+    scratch_root: &str,
+) -> Result<LocalTask> {
+    let scratch = std::path::Path::new(scratch_root).join(task.id.to_string());
+    std::fs::create_dir_all(&scratch)?;
+    Ok(LocalTask {
+        task_id: task.id,
+        unit,
+        lease_id: task.lease_id.clone(),
+        attempt: task.attempt,
+        cpu_count: task.spec.requested_cpu,
+        memory_bytes: task.spec.requested_mem_bytes,
+        gpu_count: task.spec.requested_gpus,
+        timeout_seconds: task.spec.timeout_seconds,
+        scratch,
+    })
+}
+
+fn parse_resource_set(value: &str) -> Vec<u32> {
+    let mut result = Vec::new();
+    for part in value.split(',') {
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) {
+                result.extend(start..=end);
+            }
+        } else if let Ok(index) = part.parse::<u32>() {
+            result.push(index);
+        }
+    }
+    result
+}
+
+fn standard_device_paths() -> [&'static str; 5] {
+    [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+    ]
+}
+
+fn gpu_support_device_paths() -> Vec<&'static str> {
+    [
+        "/dev/nvidiactl",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+        "/dev/nvidia-modeset",
+        "/dev/nvidia-caps/*",
+    ]
+    .into_iter()
+    .filter(|path| {
+        if path.ends_with("/*") {
+            std::path::Path::new(path.trim_end_matches("/*")).exists()
+        } else {
+            std::path::Path::new(path).exists()
+        }
+    })
+    .collect()
 }
 
 async fn poll_task(unit: &str, timeout_seconds: Option<u64>) -> Result<Option<TaskCompletion>> {
@@ -422,4 +594,22 @@ async fn stop_task_unit(unit: &str) -> Result<()> {
 
 async fn cleanup_task_unit(unit: &str) {
     let _ = stop_task_unit(unit).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_task_unit_identity() {
+        assert_eq!(parse_task_unit("tri-task-42-3"), Some((42, 3)));
+        assert_eq!(parse_task_unit("tri-task-42-3.service"), None);
+        assert_eq!(parse_task_unit("tri-task-invalid"), None);
+    }
+
+    #[test]
+    fn expands_gpu_ranges() {
+        assert_eq!(parse_resource_set("0-1,3"), vec![0, 1, 3]);
+        assert!(parse_resource_set("").is_empty());
+    }
 }

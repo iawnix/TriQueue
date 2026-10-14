@@ -33,7 +33,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=TRI_CLIENT_UNIT=tri-client.service
 Environment=TRI_SERVER_ADDR=192.168.31.243:7400
 ExecStart=%h/.local/bin/tri-client --name fed2 --address 192.168.31.18 --cpus 8 --memory 23G --gpus 0 --scratch /home/iaw/scratch
 Restart=always

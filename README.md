@@ -173,17 +173,22 @@ TRI_SOCKET=$PWD/tri.sock target/debug/tri_stat --json
 TRI_SOCKET=$PWD/tri.sock target/debug/tri_top
 ```
 
-The scheduler allocates CPU sets and GPU indexes. GPU jobs receive
-`CUDA_VISIBLE_DEVICES` and `NVIDIA_VISIBLE_DEVICES` with their assigned indexes.
-Tasks with `--mem` run in their own systemd cgroup with `MemoryMax` set to the
-requested value and swap disabled for that cgroup. Exceeding the limit ends the
-task with a memory-limit error; tasks without `--mem` have no task-specific
-memory limit. Memory and GPU usage are also tracked by the scheduler and client
-heartbeat. Each running task has a lease renewed by heartbeat. If a node stops
-renewing its lease, the task becomes `lost`; tasks with remaining
-`--max-attempts` are returned to the queue. A server cannot terminate a process
-after the client connection is lost, so use `--max-attempts` only for commands
-that tolerate a repeated or overlapping attempt.
+The scheduler allocates CPU sets and GPU indexes. Each task runs in a transient
+systemd user unit named `tri-task-<id>-<attempt>`. CPU assignments are applied
+with the unit's `AllowedCPUs` cgroup setting, and GPU assignments use device
+cgroup rules plus `CUDA_VISIBLE_DEVICES` and `NVIDIA_VISIBLE_DEVICES`. Nodes
+with non-standard GPU device paths can set `TRI_NODE_GPU_DEVICES` to a
+comma-separated list.
+
+Tasks with `--mem` run with `MemoryMax` set to the requested value and swap
+disabled for that cgroup. Exceeding the limit ends the task with a memory-limit
+error; tasks without `--mem` have no task-specific memory limit. The client
+reconciles existing task units when it starts or reconnects, so a client restart
+can adopt a still-running attempt. Units that no longer match the server's
+current attempt are stopped. Memory and GPU usage are also tracked by the
+scheduler and client heartbeat. Each running task has a lease renewed by
+heartbeat. If a node stops renewing its lease, the task becomes `lost`; tasks
+with remaining `--max-attempts` are returned to the queue.
 
 Deployment examples are under `deploy/`. The NFS examples export only
 `/home/iaw/soft` and `/DATA` from FED1 to FED2. Both hosts expose the shared

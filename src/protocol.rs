@@ -1,4 +1,4 @@
-use crate::model::{NodeHeartbeat, NodeRegistration, TaskId, TaskResult, TaskSpec};
+use crate::model::{NodeHeartbeat, NodeRegistration, ObservedUnit, TaskId, TaskResult, TaskSpec};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,6 +26,10 @@ pub enum Request {
     Register {
         node: NodeRegistration,
     },
+    Reconcile {
+        node: String,
+        units: Vec<ObservedUnit>,
+    },
     Heartbeat {
         heartbeat: NodeHeartbeat,
     },
@@ -51,6 +55,10 @@ pub enum Response {
     Assignment(Option<crate::model::TaskAssignment>),
     Heartbeat {
         cancel: Vec<TaskId>,
+    },
+    Reconciled {
+        adopt: Vec<crate::model::Task>,
+        stop: Vec<String>,
     },
     Message(String),
     Cleaned {

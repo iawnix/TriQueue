@@ -132,6 +132,15 @@ pub struct NodeRegistration {
     #[serde(default)]
     pub gpu_total: u32,
     pub scratch: String,
+    #[serde(default)]
+    pub gpu_devices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservedUnit {
+    pub unit: String,
+    pub task_id: TaskId,
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

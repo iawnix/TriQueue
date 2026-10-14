@@ -42,6 +42,7 @@ TRI_NODE_ADDRESS=192.168.31.243
 TRI_NODE_CPUS=24
 TRI_NODE_MEMORY=31G
 TRI_NODE_GPUS=1
+TRI_NODE_GPU_DEVICES=/dev/nvidia0
 TRI_NODE_SCRATCH=/home/iaw/scratch
 EOF
 cat > "$HOME/.config/systemd/user/tri-client-fed1.service" <<'EOF'
@@ -54,7 +55,6 @@ Requires=tri-server.service
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/tri/client-fed1.env
-Environment=TRI_CLIENT_UNIT=tri-client-fed1.service
 ExecStart=%h/.local/bin/tri-client
 Restart=on-failure
 RestartSec=2

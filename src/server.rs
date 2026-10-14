@@ -111,6 +111,10 @@ impl Server {
                 self.register(node);
                 Ok(Response::Ok)
             }
+            Request::Reconcile { node, units } => {
+                let (adopt, stop) = self.reconcile(&node, &units)?;
+                Ok(Response::Reconciled { adopt, stop })
+            }
             Request::Heartbeat { heartbeat } => {
                 let cancel = self.heartbeat(heartbeat)?;
                 Ok(Response::Heartbeat { cancel })
@@ -176,6 +180,31 @@ impl Server {
             }
         }
         Ok(cancelled)
+    }
+
+    fn reconcile(
+        &self,
+        node_name: &str,
+        units: &[crate::model::ObservedUnit],
+    ) -> Result<(Vec<crate::model::Task>, Vec<String>)> {
+        let mut adopt = Vec::new();
+        let mut stop = Vec::new();
+        for unit in units {
+            let Some(task) = self.store.get(unit.task_id)? else {
+                stop.push(unit.unit.clone());
+                continue;
+            };
+            let matches_current_attempt = task.node.as_deref() == Some(node_name)
+                && task.attempt == unit.attempt
+                && task.lease_id.is_some()
+                && matches!(task.state, TaskState::Run | TaskState::Cancel);
+            if matches_current_attempt {
+                adopt.push(task);
+            } else {
+                stop.push(unit.unit.clone());
+            }
+        }
+        Ok((adopt, stop))
     }
 
     fn poll(&self, node_name: &str) -> Result<Option<crate::model::TaskAssignment>> {
@@ -370,6 +399,7 @@ mod tests {
                     memory_bytes: 1024,
                     gpu_total: 0,
                     scratch: PathBuf::from("/tmp").to_string_lossy().into_owned(),
+                    gpu_devices: Vec::new(),
                 },
             })
             .unwrap();
