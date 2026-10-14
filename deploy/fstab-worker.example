@@ -1,3 +1,0 @@
-# Worker node: mount the shared software and data at the same paths.
-192.0.2.10:/opt/tri/software /opt/tri/software nfs4 ro,_netdev,x-systemd.automount 0 0
-192.0.2.10:/srv/tri-data     /srv/tri-data     nfs4 rw,_netdev,x-systemd.automount 0 0

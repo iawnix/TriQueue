@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::HashMap;
-use std::process::Stdio;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep};
 use tri::client;
 use tri::model::{NodeHeartbeat, NodeRegistration, RunningTask, TaskId, TaskResult, TaskState};
@@ -28,12 +27,19 @@ struct Args {
 
 struct LocalTask {
     task_id: TaskId,
+    unit: String,
+    lease_id: Option<String>,
+    attempt: u32,
     cpu_count: u32,
     memory_bytes: u64,
     gpu_count: u32,
     scratch: std::path::PathBuf,
-    pid: Option<u32>,
-    child: Child,
+}
+
+struct TaskCompletion {
+    state: TaskState,
+    exit_code: Option<i32>,
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -64,36 +70,36 @@ async fn main() -> Result<()> {
     }
 
     let mut running: HashMap<TaskId, LocalTask> = HashMap::new();
+    let client_unit = std::env::var("TRI_CLIENT_UNIT").ok();
     let mut next_heartbeat = Instant::now();
     let mut next_registration = Instant::now() + Duration::from_secs(10);
     loop {
         let mut completed = Vec::new();
-        for (id, local) in running.iter_mut() {
-            if let Some(status) = local.child.try_wait()? {
-                completed.push((*id, status.code()));
+        for (id, local) in &running {
+            if let Some(result) = poll_task(&local.unit).await? {
+                completed.push((*id, result));
             }
         }
-        for (id, code) in completed {
-            if let Some(local) = running.remove(&id)
-                && let Err(error) = std::fs::remove_dir_all(&local.scratch)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(task = id, %error, "failed to remove task scratch directory");
+        for (id, result) in completed {
+            if let Some(local) = running.remove(&id) {
+                if let Err(error) = std::fs::remove_dir_all(&local.scratch)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(task = id, %error, "failed to remove task scratch directory");
+                }
+                cleanup_task_unit(&local.unit).await;
+                let _ = client::tcp(&Request::Complete {
+                    result: TaskResult {
+                        id,
+                        state: result.state,
+                        exit_code: result.exit_code,
+                        error: result.error,
+                        attempt: local.attempt,
+                        lease_id: local.lease_id,
+                    },
+                })
+                .await;
             }
-            let state = if code == Some(0) {
-                TaskState::Done
-            } else {
-                TaskState::Fail
-            };
-            let _ = client::tcp(&Request::Complete {
-                result: TaskResult {
-                    id,
-                    state,
-                    exit_code: code,
-                    error: None,
-                },
-            })
-            .await;
         }
 
         let now = Instant::now();
@@ -131,6 +137,7 @@ async fn main() -> Result<()> {
                             cpu_count: task.cpu_count,
                             memory_bytes: task.memory_bytes,
                             gpu_count: task.gpu_count,
+                            lease_id: task.lease_id.clone(),
                         })
                         .collect(),
                 },
@@ -138,12 +145,8 @@ async fn main() -> Result<()> {
             .await;
             if let Ok(Response::Heartbeat { cancel }) = response {
                 for id in cancel {
-                    if let Some(task) = running.get_mut(&id) {
-                        if let Some(pid) = task.pid {
-                            terminate_group(pid);
-                        } else {
-                            let _ = task.child.kill().await;
-                        }
+                    if let Some(unit) = running.get(&id).map(|task| task.unit.clone()) {
+                        let _ = stop_task_unit(&unit).await;
                     }
                 }
             }
@@ -161,6 +164,7 @@ async fn main() -> Result<()> {
                 &assignment.cpus,
                 &assignment.gpus,
                 &args.scratch,
+                client_unit.as_deref(),
             )
             .await
             {
@@ -178,6 +182,8 @@ async fn main() -> Result<()> {
                             state: TaskState::Fail,
                             exit_code: None,
                             error: Some(error.to_string()),
+                            attempt: assignment.task.attempt,
+                            lease_id: assignment.task.lease_id.clone(),
                         },
                     })
                     .await;
@@ -193,6 +199,7 @@ async fn spawn_task(
     cpus: &str,
     gpus: &str,
     scratch_root: &str,
+    client_unit: Option<&str>,
 ) -> Result<Option<LocalTask>> {
     if task.spec.command.is_empty() {
         let _ = client::tcp(&Request::Complete {
@@ -201,6 +208,8 @@ async fn spawn_task(
                 state: TaskState::Fail,
                 exit_code: None,
                 error: Some("empty command".into()),
+                attempt: task.attempt,
+                lease_id: task.lease_id.clone(),
             },
         })
         .await;
@@ -216,74 +225,186 @@ async fn spawn_task(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let stdout = std::fs::File::create(&task.stdout_path)
-        .with_context(|| format!("opening {}", task.stdout_path))?;
-    let stderr = if task.stderr_path == task.stdout_path {
-        stdout
-            .try_clone()
-            .with_context(|| format!("duplicating {}", task.stderr_path))?
-    } else {
-        std::fs::File::create(&task.stderr_path)
-            .with_context(|| format!("opening {}", task.stderr_path))?
-    };
-    let mut command = if cpus.is_empty() {
-        let mut command = Command::new(&task.spec.command[0]);
-        command.args(&task.spec.command[1..]);
-        command
-    } else {
-        let mut command = Command::new("taskset");
-        command.arg("-c").arg(cpus).arg(&task.spec.command[0]);
-        command.args(&task.spec.command[1..]);
-        command
-    };
-    if let Some(cwd) = &task.spec.cwd {
-        command.env("TRI_JOB_CWD", cwd);
-    }
-    if task.spec.scratch_cwd {
-        command.current_dir(&scratch);
+    let workdir = if task.spec.scratch_cwd {
+        scratch.clone()
     } else if let Some(cwd) = &task.spec.cwd {
-        command.current_dir(cwd);
+        std::path::PathBuf::from(cwd)
+    } else {
+        std::env::current_dir()?
+    };
+    let unit = format!("tri-task-{}-{}", task.id, task.attempt);
+    let mut command = Command::new("systemd-run");
+    command.args([
+        "--user",
+        "--quiet",
+        "--no-block",
+        "--remain-after-exit",
+        "--service-type=exec",
+        "--unit",
+        &unit,
+        "--working-directory",
+    ]);
+    command.arg(&workdir);
+    command.args([
+        "--property",
+        &format!("StandardOutput=append:{}", task.stdout_path),
+        "--property",
+        &format!("StandardError=append:{}", task.stderr_path),
+        "--property",
+        "OOMPolicy=stop",
+    ]);
+    if task.spec.requested_mem_bytes > 0 {
+        command.args([
+            "--property",
+            &format!("MemoryMax={}", task.spec.requested_mem_bytes),
+            "--property",
+            "MemorySwapMax=0",
+        ]);
     }
-    command.env("TRI_TASK_ID", task.id.to_string());
-    command.env("TRI_SCRATCH", &scratch);
-    command.env("TMPDIR", &scratch);
+    if let Some(client_unit) = client_unit {
+        command.args([
+            "--property",
+            &format!("BindsTo={client_unit}"),
+            "--property",
+            &format!("PartOf={client_unit}"),
+        ]);
+    }
+    if let Some(cwd) = &task.spec.cwd {
+        command.args(["--setenv", &format!("TRI_JOB_CWD={cwd}")]);
+    }
+    command.args([
+        "--setenv",
+        &format!("TRI_TASK_ID={}", task.id),
+        "--setenv",
+        &format!("TRI_SCRATCH={}", scratch.display()),
+        "--setenv",
+        &format!("TMPDIR={}", scratch.display()),
+    ]);
     for (key, value) in &task.spec.env {
-        command.env(key, value);
+        command.args(["--setenv", &format!("{key}={value}")]);
     }
     if !gpus.is_empty() {
-        command.env("CUDA_VISIBLE_DEVICES", gpus);
-        command.env("NVIDIA_VISIBLE_DEVICES", gpus);
+        command.args([
+            "--setenv",
+            &format!("CUDA_VISIBLE_DEVICES={gpus}"),
+            "--setenv",
+            &format!("NVIDIA_VISIBLE_DEVICES={gpus}"),
+        ]);
     }
-    command.stdout(Stdio::from(stdout));
-    command.stderr(Stdio::from(stderr));
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    if cpus.is_empty() {
+        command.arg(&task.spec.command[0]);
+        command.args(&task.spec.command[1..]);
+    } else {
+        command.args(["taskset", "-c", cpus, &task.spec.command[0]]);
+        command.args(&task.spec.command[1..]);
     }
-    let child = command.spawn().with_context(|| {
-        format!(
-            "starting task {}: {}",
-            task.id,
-            tri::command_to_string(&task.spec.command)
-        )
-    })?;
+    let status = command
+        .status()
+        .await
+        .with_context(|| format!("starting task service for {}", task.id))?;
+    anyhow::ensure!(
+        status.success(),
+        "systemd-run could not start task {} (status {})",
+        task.id,
+        status
+    );
     Ok(Some(LocalTask {
         task_id: task.id,
+        unit,
+        lease_id: task.lease_id.clone(),
+        attempt: task.attempt,
         cpu_count: task.spec.requested_cpu,
         memory_bytes: task.spec.requested_mem_bytes,
         gpu_count: task.spec.requested_gpus,
         scratch,
-        pid: child.id(),
-        child,
     }))
 }
 
-fn terminate_group(pid: u32) {
-    unsafe {
-        let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+async fn poll_task(unit: &str) -> Result<Option<TaskCompletion>> {
+    let unit = format!("{unit}.service");
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &unit,
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "Result",
+            "-p",
+            "ExecMainCode",
+            "-p",
+            "ExecMainStatus",
+        ])
+        .output()
+        .await
+        .with_context(|| format!("checking task service {unit}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "systemctl could not inspect task service {unit}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fields = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<HashMap<_, _>>();
+    if fields.get("LoadState") == Some(&"not-found") {
+        anyhow::bail!("task service {unit} disappeared")
     }
+    let active = fields.get("ActiveState").copied().unwrap_or_default();
+    let sub = fields.get("SubState").copied().unwrap_or_default();
+    if active == "activating" || active == "deactivating" || (active == "active" && sub != "exited")
+    {
+        return Ok(None);
+    }
+    let result = fields.get("Result").copied().unwrap_or_default();
+    let status = fields
+        .get("ExecMainStatus")
+        .and_then(|value| value.parse::<i32>().ok());
+    if result == "oom-kill" {
+        return Ok(Some(TaskCompletion {
+            state: TaskState::Fail,
+            exit_code: None,
+            error: Some("memory limit exceeded (MemoryMax)".into()),
+        }));
+    }
+    let success = result == "success" && status == Some(0);
+    Ok(Some(TaskCompletion {
+        state: if success {
+            TaskState::Done
+        } else {
+            TaskState::Fail
+        },
+        exit_code: status,
+        error: (!success).then(|| {
+            if let Some(status) = status {
+                format!("task exited with status {status}")
+            } else {
+                format!("task ended with systemd result {result}")
+            }
+        }),
+    }))
+}
+
+async fn stop_task_unit(unit: &str) -> Result<()> {
+    let unit = format!("{unit}.service");
+    let status = Command::new("systemctl")
+        .args(["--user", "stop", &unit])
+        .status()
+        .await
+        .with_context(|| format!("stopping task service {unit}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "systemctl could not stop task service {unit}"
+    );
+    Ok(())
+}
+
+async fn cleanup_task_unit(unit: &str) {
+    let _ = stop_task_unit(unit).await;
 }

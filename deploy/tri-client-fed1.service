@@ -1,15 +1,16 @@
 [Unit]
-Description=tri compute client on PRIMARY
+Description=tri compute client on FED1
 After=network-online.target tri-server.service
 Wants=network-online.target
 Requires=tri-server.service
 
 [Service]
 Type=simple
-User=triuser
-Group=triuser
+User=iaw
+Group=iaw
+Environment=TRI_CLIENT_UNIT=tri-client-fed1.service
 Environment=TRI_SERVER_ADDR=127.0.0.1:7400
-ExecStart=/usr/local/bin/tri-client --name primary --address 192.0.2.10 --cpus 8 --memory 16G --gpus 0 --scratch /var/tmp/tri-scratch
+ExecStart=/usr/local/bin/tri-client --name fed1 --address 192.168.31.243 --cpus 24 --memory 31G --gpus 1 --scratch /home/iaw/scratch
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true

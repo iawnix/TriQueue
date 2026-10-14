@@ -96,7 +96,7 @@ pub fn nodes(nodes: &[NodeInfo]) {
 
 /// Show the scheduler queue and a compact count of every task state.
 pub fn queue(items: &[Task]) {
-    let mut counts = [0usize; 6];
+    let mut counts = [0usize; 7];
     for task in items {
         let index = match &task.state {
             TaskState::Wait => 0,
@@ -105,18 +105,20 @@ pub fn queue(items: &[Task]) {
             TaskState::Fail => 3,
             TaskState::Cancel => 4,
             TaskState::Lost => 5,
+            TaskState::Blocked => 6,
         };
         counts[index] += 1;
     }
     println!(
-        "Queue  {} total   {} wait   {} run   {} done   {} fail   {} cancel   {} lost",
+        "Queue  {} total   {} wait   {} run   {} done   {} fail   {} cancel   {} lost   {} blocked",
         items.len(),
         counts[0],
         counts[1],
         counts[2],
         counts[3],
         counts[4],
-        counts[5]
+        counts[5],
+        counts[6]
     );
     let active: Vec<_> = items
         .iter()
@@ -138,6 +140,7 @@ pub fn colored_state(state: &TaskState) -> String {
         TaskState::Fail => "fail".red().bold().to_string(),
         TaskState::Cancel => "cancel".dimmed().to_string(),
         TaskState::Lost => "lost".magenta().bold().to_string(),
+        TaskState::Blocked => "blocked".yellow().bold().to_string(),
     }
 }
 
@@ -151,4 +154,33 @@ pub fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+pub fn task_json(task: &Task) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(task)?);
+    Ok(())
+}
+
+pub fn tasks_json(tasks: &[Task]) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(tasks)?);
+    Ok(())
+}
+
+pub fn nodes_json(nodes: &[NodeInfo]) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(nodes)?);
+    Ok(())
+}
+
+pub fn json_error(error: &anyhow::Error) -> ! {
+    println!(
+        "{}",
+        serde_json::json!({
+            "error": {
+                "code": "request_failed",
+                "message": error.to_string(),
+                "retryable": true
+            }
+        })
+    );
+    std::process::exit(1)
 }

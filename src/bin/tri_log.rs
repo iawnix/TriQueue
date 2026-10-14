@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use tokio::time::{Duration, sleep};
 use tri::client;
 use tri::protocol::{Request, Response};
@@ -18,32 +18,44 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let task = match client::local(&Request::Get { id: args.id }).await? {
+    let initial = match client::local(&Request::Get { id: args.id }).await? {
         Response::Task(task) => task,
         other => anyhow::bail!("unexpected response: {other:?}"),
     };
     let path = if args.stderr {
-        task.stderr_path
+        initial.stderr_path
     } else {
-        task.stdout_path
+        initial.stdout_path
     };
     let mut offset = 0u64;
     loop {
-        let mut file = std::fs::File::open(&path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = String::new();
-        file.read_to_string(&mut buf)?;
-        offset += buf.len() as u64;
-        print!("{buf}");
-        if !args.follow
-            || matches!(
-                task.state,
-                tri::model::TaskState::Done
-                    | tri::model::TaskState::Fail
-                    | tri::model::TaskState::Cancel
-                    | tri::model::TaskState::Lost
-            )
-        {
+        match std::fs::File::open(&path) {
+            Ok(mut file) => {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buf = String::new();
+                file.read_to_string(&mut buf)?;
+                offset += buf.len() as u64;
+                print!("{buf}");
+                std::io::stdout().flush()?;
+            }
+            Err(error) if args.follow && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if !args.follow {
+            break;
+        }
+        let task = match client::local(&Request::Get { id: args.id }).await? {
+            Response::Task(task) => task,
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        };
+        if matches!(
+            task.state,
+            tri::model::TaskState::Done
+                | tri::model::TaskState::Fail
+                | tri::model::TaskState::Cancel
+                | tri::model::TaskState::Lost
+                | tri::model::TaskState::Blocked
+        ) {
             break;
         }
         sleep(Duration::from_millis(500)).await;

@@ -11,6 +11,8 @@ struct Args {
     id: Option<i64>,
     #[arg(long, help = "limit the queue view to one state")]
     state: Option<String>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -20,7 +22,14 @@ async fn main() -> Result<()> {
         Some(id) => Request::Get { id },
         None => Request::List { state: args.state },
     };
-    match client::local(&request).await? {
+    let response = match client::local(&request).await {
+        Ok(response) => response,
+        Err(error) if args.json => output::json_error(&error),
+        Err(error) => return Err(error),
+    };
+    match response {
+        Response::Task(task) if args.json => output::task_json(&task)?,
+        Response::Tasks(tasks) if args.json => output::tasks_json(&tasks)?,
         Response::Task(task) => output::task(&task),
         Response::Tasks(tasks) => output::queue(&tasks),
         other => anyhow::bail!("unexpected response: {other:?}"),

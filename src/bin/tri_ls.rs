@@ -16,10 +16,13 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    match client::local(&Request::List { state: args.state }).await? {
-        Response::Tasks(tasks) if args.json => {
-            println!("{}", serde_json::to_string_pretty(&tasks)?)
-        }
+    let response = match client::local(&Request::List { state: args.state }).await {
+        Ok(response) => response,
+        Err(error) if args.json => output::json_error(&error),
+        Err(error) => return Err(error),
+    };
+    match response {
+        Response::Tasks(tasks) if args.json => output::tasks_json(&tasks)?,
         Response::Tasks(tasks) => output::tasks(&tasks),
         other => anyhow::bail!("unexpected response: {other:?}"),
     }

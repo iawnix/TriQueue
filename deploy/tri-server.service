@@ -5,13 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=triuser
-Group=triuser
+User=iaw
+Group=iaw
 RuntimeDirectory=tri
 StateDirectory=tri
 Environment=TRI_SOCKET=/run/tri/server.sock
 Environment=TRI_SERVER_ADDR=0.0.0.0:7400
-Environment=TRI_DATA_DIR=/srv/tri-data/tri
+Environment=TRI_DATA_DIR=/home/iaw/DATA/tri
 Environment=TRI_DB=/var/lib/tri/tri.db
 ExecStart=/usr/local/bin/tri-server
 Restart=on-failure

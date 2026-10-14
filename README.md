@@ -1,7 +1,7 @@
-# tri-queue
+# tri
 
-`tri` is a small Rust task queue for a two-node compute setup. It keeps the
-control plane on `PRIMARY`, runs a small client on each compute node, and leaves
+`tri` is a small Rust task queue for the two-node 3w cluster. It keeps the
+control plane on `FED1`, runs a small client on each compute node, and leaves
 software/data sharing to NFS.
 
 ## Commands
@@ -16,6 +16,11 @@ tri_node      list nodes
 tri_top       terminal dashboard
 tri_clean     remove finished task records
 ```
+
+`tri_sub`, `tri_ls`, `tri_stat`, `tri_node`, `tri_del`, and `tri_clean` support
+`--json` for scripts and agents. The JSON contains queue metadata such as task
+state, attempt, lease, exit code, and log paths. `tri_log` keeps stdout and
+stderr as raw task output.
 
 `tri_ls` includes a `TIME` column. It shows elapsed runtime as `HH:MM:SS`
 (or `D-HH:MM:SS` for jobs lasting more than a day); running jobs update on
@@ -34,7 +39,7 @@ the script directly to `tri_sub`:
 ```bash
 #!/usr/bin/env bash
 # tri_name: gaussian-water
-# tri_node: worker
+# tri_node: fed2
 # tri_cpu: 1
 # tri_mem: 512M
 # tri_gpu: 1
@@ -47,7 +52,7 @@ set -Eeuo pipefail
 scratch=${TRI_SCRATCH:?tri-client did not provide TRI_SCRATCH}
 export TMPDIR="$scratch"
 
-exec /opt/tri/software/gaussian/bin/gaussian16-run water.gjf water.log
+exec /home/iaw/soft/gaussian/bin/gaussian16-run water.gjf water.log
 ```
 
 Submit it with `tri_sub --chdir JOB_DIRECTORY -- ./job.sh`. The supported
@@ -62,12 +67,18 @@ For example:
 tri_sub --chdir "$PWD" --gpu 1 --scratch-cwd --output result.out --error result.err -- ./job.sh
 ```
 
+Use `--after TASK_ID` to wait for an earlier task to finish successfully;
+repeat it for multiple prerequisites. A prerequisite that fails, is cancelled,
+or is lost blocks the dependent task. Use `--max-attempts N` to requeue a task
+after a node lease expires. The default is one attempt, so jobs with side
+effects are not duplicated unless requested.
+
 A complete scratch-based job can look like this:
 
 ```bash
 #!/usr/bin/env bash
 # tri_name: gpu-example
-# tri_node: primary
+# tri_node: fed1
 # tri_cpu: 4
 # tri_mem: 8G
 # tri_gpu: 1
@@ -83,7 +94,7 @@ cp "$job_dir/input.dat" "$scratch/"
 cd "$scratch"
 
 # Replace this with the actual calculation command.
-/opt/tri/software/my-program input.dat result.dat
+/home/iaw/soft/my-program input.dat result.dat
 
 cp result.dat "$job_dir/"
 ```
@@ -95,12 +106,12 @@ tri_sub --chdir "$PWD" --output result.out --error result.err -- ./job.sh
 ```
 
 Each running task receives a node-local temporary directory in `TRI_SCRATCH`,
-for example `/var/tmp/tri-scratch/<id>`. Use `--scratch-cwd` or `# tri_scratch: true`
+for example `/home/iaw/scratch/<id>`. Use `--scratch-cwd` or `# tri_scratch: true`
 to start the task in that directory; otherwise the task starts in `--chdir`.
 The original `--chdir` value remains available as `TRI_JOB_CWD`. A script can
 copy inputs into scratch, run there, copy final results back to the shared job
 directory, and remove scratch when it is finished. The client also performs
-best-effort cleanup after the task exits. Do not hardcode the PRIMARY or WORKER
+best-effort cleanup after the task exits. Do not hardcode the FED1 or FED2
 scratch path because the scheduler may choose either node. Final results and
 logs should remain in the shared job directory or in the paths selected with
 `--output` and `--error`.
@@ -133,9 +144,9 @@ Start a client in a second terminal:
 
 ```bash
 TRI_SERVER_ADDR=127.0.0.1:7400 \
-TRI_NODE=worker \
+TRI_NODE=fed2 \
 TRI_NODE_CPUS=8 \
-TRI_NODE_MEMORY=16G \
+TRI_NODE_MEMORY=23G \
 TRI_NODE_GPUS=0 \
 TRI_NODE_SCRATCH=$PWD/scratch \
 target/debug/tri-client
@@ -144,26 +155,35 @@ target/debug/tri-client
 Then submit and inspect a task from a third terminal:
 
 ```bash
-TRI_SOCKET=$PWD/tri.sock target/debug/tri_sub --name hello --node worker --cpu 2 -- bash -lc 'echo start; sleep 1; echo done'
+TRI_SOCKET=$PWD/tri.sock target/debug/tri_sub --name hello --node fed2 --cpu 2 -- bash -lc 'echo start; sleep 1; echo done'
 TRI_SOCKET=$PWD/tri.sock target/debug/tri_stat
 TRI_SOCKET=$PWD/tri.sock target/debug/tri_ls
+TRI_SOCKET=$PWD/tri.sock target/debug/tri_stat --json
 TRI_SOCKET=$PWD/tri.sock target/debug/tri_top
 ```
 
 The scheduler allocates CPU sets and GPU indexes. GPU jobs receive
 `CUDA_VISIBLE_DEVICES` and `NVIDIA_VISIBLE_DEVICES` with their assigned indexes.
-Memory and GPU usage are tracked by the scheduler and client heartbeat; hard cgroup memory
-limits are the next deployment step when the systemd service units are added.
+Tasks with `--mem` run in their own systemd cgroup with `MemoryMax` set to the
+requested value and swap disabled for that cgroup. Exceeding the limit ends the
+task with a memory-limit error; tasks without `--mem` have no task-specific
+memory limit. Memory and GPU usage are also tracked by the scheduler and client
+heartbeat. Each running task has a lease renewed by heartbeat. If a node stops
+renewing its lease, the task becomes `lost`; tasks with remaining
+`--max-attempts` are returned to the queue. A server cannot terminate a process
+after the client connection is lost, so use `--max-attempts` only for commands
+that tolerate a repeated or overlapping attempt.
 
 Deployment examples are under `deploy/`. The NFS examples export only
-`/opt/tri/software` and `/srv/tri-data` from PRIMARY to WORKER. Both hosts expose the shared
-data through `/srv/tri-data`; on WORKER that path is the NFS filesystem. Keep the SQLite
-database on PRIMARY's local filesystem; only task inputs, outputs, and logs belong
+`/home/iaw/soft` and `/DATA` from FED1 to FED2. Both hosts expose the shared
+data through `/home/iaw/DATA`, which is a symlink to the local mount point
+`/DATA`; on FED2 that mount point is the NFS filesystem. Keep the SQLite
+database on FED1's local filesystem; only task inputs, outputs, and logs belong
 on the shared data path.
 
 The user-level binaries and services can be installed without root. To finish
-machine setup, run `deploy/enable-primary.sh` as the service account on PRIMARY and
-`deploy/enable-worker.sh` as the service account on WORKER. Those scripts use `sudo` for the NFS,
+machine setup, run `deploy/enable-fed1.sh` as `iaw` on FED1 and
+`deploy/enable-fed2.sh` as `iaw` on FED2. Those scripts use `sudo` for the NFS,
 firewall, mount, and login-linger steps, then restart the existing user
-services. PRIMARY's script also starts a `tri-client` for PRIMARY itself, so both
+services. FED1's script also starts a `tri-client` for FED1 itself, so both
 hosts appear in `tri_node`.

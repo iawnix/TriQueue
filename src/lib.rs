@@ -70,11 +70,15 @@ pub fn ensure_parent(path: &std::path::Path) -> Result<()> {
 }
 
 pub fn now_string() -> String {
+    now_seconds().to_string()
+}
+
+pub fn now_seconds() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".into())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// Format elapsed task runtime from Unix-second timestamps.

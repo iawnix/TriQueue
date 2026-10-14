@@ -1,3 +1,3 @@
-# Primary node: export only the intended paths to the worker node.
-/opt/tri/software 192.0.2.11(ro,sync,root_squash)
-/srv/tri-data     192.0.2.11(rw,sync,root_squash)
+# FED1: export only the two intended paths to FED2.
+/home/iaw/soft 192.168.31.18(ro,sync,root_squash)
+/DATA          192.168.31.18(rw,sync,root_squash)

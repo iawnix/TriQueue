@@ -22,6 +22,12 @@ struct Args {
     scratch_cwd: Option<bool>,
     #[arg(long)]
     node: Option<String>,
+    #[arg(long = "after", value_name = "ID")]
+    after: Vec<i64>,
+    #[arg(long, default_value_t = 1)]
+    max_attempts: u32,
+    #[arg(long)]
+    json: bool,
     #[arg(
         long = "chdir",
         alias = "cwd",
@@ -204,7 +210,7 @@ async fn main() -> Result<()> {
     };
 
     eprintln!("submitting {}", command_to_string(&command));
-    match client::local(&Request::Submit {
+    let response = match client::local(&Request::Submit {
         spec: TaskSpec {
             name,
             command,
@@ -217,10 +223,18 @@ async fn main() -> Result<()> {
             env: args.env,
             output_path: output,
             error_path: error,
+            depends_on: args.after,
+            max_attempts: args.max_attempts,
         },
     })
-    .await?
+    .await
     {
+        Ok(response) => response,
+        Err(error) if args.json => tri::output::json_error(&error),
+        Err(error) => return Err(error),
+    };
+    match response {
+        Response::Task(task) if args.json => tri::output::task_json(&task)?,
         Response::Task(task) => println!("{}", task.id),
         other => anyhow::bail!("unexpected response: {other:?}"),
     }

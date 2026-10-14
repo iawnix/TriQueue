@@ -2,7 +2,7 @@
 name = "tri"
 version = "0.1.0"
 edition = "2024"
-description = "A small Rust task queue for multi-node compute workloads"
+description = "A small two-node task queue for the 3w cluster"
 license = "MIT"
 
 [lib]

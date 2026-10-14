@@ -26,5 +26,6 @@ pub enum Response {
     Assignment(Option<crate::model::TaskAssignment>),
     Heartbeat { cancel: Vec<TaskId> },
     Message(String),
+    Cleaned { removed: usize },
     Error(String),
 }

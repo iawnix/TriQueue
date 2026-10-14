@@ -11,6 +11,7 @@ pub enum TaskState {
     Fail,
     Cancel,
     Lost,
+    Blocked,
 }
 
 impl TaskState {
@@ -22,6 +23,7 @@ impl TaskState {
             Self::Fail => "fail",
             Self::Cancel => "cancel",
             Self::Lost => "lost",
+            Self::Blocked => "blocked",
         }
     }
 }
@@ -49,6 +51,14 @@ pub struct TaskSpec {
     pub output_path: Option<String>,
     #[serde(default)]
     pub error_path: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_max_attempts() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +77,12 @@ pub struct Task {
     pub stdout_path: String,
     pub stderr_path: String,
     pub error: Option<String>,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub lease_id: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +110,8 @@ pub struct RunningTask {
     pub memory_bytes: u64,
     #[serde(default)]
     pub gpu_count: u32,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,4 +148,8 @@ pub struct TaskResult {
     pub state: TaskState,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
