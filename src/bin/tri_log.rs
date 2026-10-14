@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
                 | tri::model::TaskState::Cancel
                 | tri::model::TaskState::Lost
                 | tri::model::TaskState::Blocked
+                | tri::model::TaskState::TimedOut
         ) {
             break;
         }

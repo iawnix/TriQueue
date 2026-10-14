@@ -42,9 +42,15 @@ impl Store {
                assigned_gpus TEXT,
                attempt INTEGER NOT NULL DEFAULT 0,
                lease_id TEXT,
-               lease_expires_at TEXT
+               lease_expires_at TEXT,
+               external_id TEXT
              );
-             CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, id);",
+             CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, id);
+             CREATE TABLE IF NOT EXISTS submission_receipts (
+               request_id TEXT PRIMARY KEY,
+               fingerprint TEXT NOT NULL,
+               task_id INTEGER NOT NULL
+             );",
         )?;
         let has_assigned_gpus: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='assigned_gpus'",
@@ -58,6 +64,7 @@ impl Store {
             ("attempt", "INTEGER NOT NULL DEFAULT 0"),
             ("lease_id", "TEXT"),
             ("lease_expires_at", "TEXT"),
+            ("external_id", "TEXT"),
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name=?1",
@@ -71,6 +78,11 @@ impl Store {
                 )?;
             }
         }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external_id
+             ON tasks(external_id) WHERE external_id IS NOT NULL",
+            [],
+        )?;
         std::fs::create_dir_all(data_dir.join("tasks"))?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -79,14 +91,94 @@ impl Store {
     }
 
     pub fn submit(&self, spec: TaskSpec) -> Result<Task> {
+        Ok(self.submit_with_receipt(None, spec)?.0)
+    }
+
+    pub fn submit_with_receipt(
+        &self,
+        request_id: Option<&str>,
+        spec: TaskSpec,
+    ) -> Result<(Task, bool)> {
         anyhow::ensure!(
             spec.max_attempts > 0,
             "max_attempts must be greater than zero"
         );
+        if let Some(request_id) = request_id {
+            anyhow::ensure!(
+                !request_id.trim().is_empty(),
+                "request_id must not be empty"
+            );
+        }
+        if let Some(external_id) = &spec.external_id {
+            anyhow::ensure!(
+                !external_id.trim().is_empty(),
+                "external_id must not be empty"
+            );
+        }
+        if let Some(timeout) = spec.timeout_seconds {
+            anyhow::ensure!(timeout > 0, "timeout_seconds must be greater than zero");
+        }
         let created_at = now_string();
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let fingerprint = serde_json::to_string(&spec)?;
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+
+        if let Some(request_id) = request_id
+            && let Some((stored_fingerprint, task_id)) = tx
+                .query_row(
+                    "SELECT fingerprint, task_id FROM submission_receipts WHERE request_id=?1",
+                    params![request_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, TaskId>(1)?)),
+                )
+                .optional()?
+        {
+            anyhow::ensure!(
+                stored_fingerprint == fingerprint,
+                "request_id_reused: request_id belongs to a different submission"
+            );
+            let task = tx
+                .query_row(
+                    "SELECT * FROM tasks WHERE id=?1",
+                    params![task_id],
+                    row_to_task,
+                )
+                .optional()?
+                .context("submission receipt points to a missing task")?;
+            tx.commit()?;
+            return Ok((task, false));
+        }
+
+        if let Some(external_id) = &spec.external_id
+            && let Some((task_id, stored_fingerprint)) = tx
+                .query_row(
+                    "SELECT id, spec_json FROM tasks WHERE external_id=?1",
+                    params![external_id],
+                    |row| Ok((row.get::<_, TaskId>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+        {
+            anyhow::ensure!(
+                stored_fingerprint == fingerprint,
+                "external_id_conflict: external_id belongs to a different submission"
+            );
+            if let Some(request_id) = request_id {
+                tx.execute(
+                    "INSERT INTO submission_receipts (request_id, fingerprint, task_id)
+                         VALUES (?1, ?2, ?3)",
+                    params![request_id, fingerprint, task_id],
+                )?;
+            }
+            let task = tx.query_row(
+                "SELECT * FROM tasks WHERE id=?1",
+                params![task_id],
+                row_to_task,
+            )?;
+            tx.commit()?;
+            return Ok((task, false));
+        }
+
         for dependency in &spec.depends_on {
-            let exists: Option<i64> = conn
+            let exists: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM tasks WHERE id=?1",
                     params![dependency],
@@ -98,12 +190,12 @@ impl Store {
                 "dependency task {dependency} does not exist"
             );
         }
-        conn.execute(
-            "INSERT INTO tasks (spec_json, state, created_at, stdout_path, stderr_path)
-             VALUES (?1, 'wait', ?2, '', '')",
-            params![serde_json::to_string(&spec)?, created_at],
+        tx.execute(
+            "INSERT INTO tasks (spec_json, state, created_at, stdout_path, stderr_path, external_id)
+             VALUES (?1, 'wait', ?2, '', '', ?3)",
+            params![fingerprint, created_at, spec.external_id],
         )?;
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
         let stdout = resolve_log_path(
             spec.output_path.as_deref(),
             &spec,
@@ -123,12 +215,20 @@ impl Store {
                 )
             },
         );
-        conn.execute(
+        tx.execute(
             "UPDATE tasks SET stdout_path=?1, stderr_path=?2 WHERE id=?3",
             params![stdout.to_string_lossy(), stderr.to_string_lossy(), id],
         )?;
+        if let Some(request_id) = request_id {
+            tx.execute(
+                "INSERT INTO submission_receipts (request_id, fingerprint, task_id)
+                 VALUES (?1, ?2, ?3)",
+                params![request_id, fingerprint, id],
+            )?;
+        }
+        tx.commit()?;
         drop(conn);
-        self.get(id)?.context("new task disappeared")
+        Ok((self.get(id)?.context("new task disappeared")?, true))
     }
 
     pub fn list(&self, state: Option<&str>) -> Result<Vec<Task>> {
@@ -150,6 +250,17 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         Ok(conn
             .query_row("SELECT * FROM tasks WHERE id=?1", params![id], row_to_task)
+            .optional()?)
+    }
+
+    pub fn get_external(&self, external_id: &str) -> Result<Option<Task>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT * FROM tasks WHERE external_id=?1",
+                params![external_id],
+                row_to_task,
+            )
             .optional()?)
     }
 
@@ -220,11 +331,18 @@ impl Store {
     }
 
     pub fn clean(&self) -> Result<usize> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        Ok(conn.execute(
-            "DELETE FROM tasks WHERE state IN ('done','fail','cancel','lost','blocked')",
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM tasks WHERE state IN ('done','fail','cancel','lost','blocked','timed_out')",
             [],
-        )?)
+        )?;
+        tx.execute(
+            "DELETE FROM submission_receipts WHERE task_id NOT IN (SELECT id FROM tasks)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn dependency_status(&self, task: &Task) -> Result<DependencyStatus> {
@@ -374,6 +492,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
             "cancel" => TaskState::Cancel,
             "lost" => TaskState::Lost,
             "blocked" => TaskState::Blocked,
+            "timed_out" => TaskState::TimedOut,
             _ => TaskState::Fail,
         },
         node: row.get(3)?,
@@ -389,6 +508,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         attempt: row.get(13)?,
         lease_id: row.get(14)?,
         lease_expires_at: row.get(15)?,
+        external_id: row.get(16)?,
     })
 }
 
@@ -405,6 +525,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "test".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 2,
                 requested_mem_bytes: 1024,
                 requested_gpus: 0,
@@ -444,6 +566,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "cancel".into(),
                 command: vec!["sleep".into(), "10".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 1,
                 requested_gpus: 0,
@@ -486,6 +610,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "first".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -503,6 +629,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "second".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -547,6 +675,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "lost".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -568,6 +698,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "retry".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -598,6 +730,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "renew".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -638,6 +772,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "stale".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -682,6 +818,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "default".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -705,6 +843,8 @@ mod tests {
             .submit(TaskSpec {
                 name: "custom".into(),
                 command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
                 requested_cpu: 1,
                 requested_mem_bytes: 0,
                 requested_gpus: 0,
@@ -728,6 +868,97 @@ mod tests {
             cwd.join(format!("errors/{}.err", custom.id))
                 .to_string_lossy()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submission_retries_are_idempotent_and_fingerprint_bound() {
+        let root =
+            std::env::temp_dir().join(format!("tri-idempotency-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
+        let spec = TaskSpec {
+            name: "idempotent".into(),
+            command: vec!["true".into()],
+            external_id: Some("workflow-step-a".into()),
+            timeout_seconds: Some(60),
+            requested_cpu: 1,
+            requested_mem_bytes: 0,
+            requested_gpus: 0,
+            scratch_cwd: false,
+            requested_node: None,
+            cwd: None,
+            env: Vec::new(),
+            output_path: None,
+            error_path: None,
+            depends_on: Vec::new(),
+            max_attempts: 1,
+        };
+        let (first, created) = store
+            .submit_with_receipt(Some("request-1"), spec.clone())
+            .unwrap();
+        assert!(created);
+        let (retry, created) = store
+            .submit_with_receipt(Some("request-1"), spec.clone())
+            .unwrap();
+        assert!(!created);
+        assert_eq!(retry.id, first.id);
+
+        let (external_retry, created) = store
+            .submit_with_receipt(Some("request-2"), spec.clone())
+            .unwrap();
+        assert!(!created);
+        assert_eq!(external_retry.id, first.id);
+
+        let mut changed = spec;
+        changed.command = vec!["false".into()];
+        let error = store
+            .submit_with_receipt(Some("request-1"), changed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("request_id_reused"));
+        assert_eq!(store.list(None).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn timeout_is_a_distinct_terminal_state() {
+        let root = std::env::temp_dir().join(format!("tri-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
+        let task = store
+            .submit(TaskSpec {
+                name: "timeout".into(),
+                command: vec!["sleep".into(), "10".into()],
+                external_id: None,
+                timeout_seconds: Some(1),
+                requested_cpu: 1,
+                requested_mem_bytes: 0,
+                requested_gpus: 0,
+                scratch_cwd: false,
+                requested_node: None,
+                cwd: None,
+                env: Vec::new(),
+                output_path: None,
+                error_path: None,
+                depends_on: Vec::new(),
+                max_attempts: 1,
+            })
+            .unwrap();
+        let claimed = store.claim(task.id, "fed1", "0-0", "").unwrap().unwrap();
+        let finished = store
+            .complete(&TaskResult {
+                id: task.id,
+                state: TaskState::TimedOut,
+                exit_code: None,
+                error: Some("task exceeded RuntimeMaxSec".into()),
+                attempt: claimed.attempt,
+                lease_id: claimed.lease_id,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.state, TaskState::TimedOut);
+        assert_eq!(finished.spec.timeout_seconds, Some(1));
         let _ = std::fs::remove_dir_all(root);
     }
 }

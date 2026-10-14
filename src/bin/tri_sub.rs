@@ -22,6 +22,12 @@ struct Args {
     scratch_cwd: Option<bool>,
     #[arg(long)]
     node: Option<String>,
+    #[arg(long, value_name = "ID")]
+    external_id: Option<String>,
+    #[arg(long, alias = "idempotency-key", value_name = "ID")]
+    request_id: Option<String>,
+    #[arg(long, value_name = "SECONDS", value_parser = parse_timeout)]
+    timeout: Option<u64>,
     #[arg(long = "after", value_name = "ID")]
     after: Vec<i64>,
     #[arg(long, default_value_t = 1)]
@@ -55,6 +61,17 @@ struct Args {
     command: Vec<String>,
 }
 
+fn parse_timeout(value: &str) -> Result<u64, String> {
+    let timeout = value
+        .parse::<u64>()
+        .map_err(|_| "timeout must be a positive number of seconds".to_owned())?;
+    if timeout == 0 {
+        Err("timeout must be greater than zero".into())
+    } else {
+        Ok(timeout)
+    }
+}
+
 fn parse_env(value: &str) -> Result<(String, String), String> {
     value
         .split_once('=')
@@ -80,6 +97,7 @@ struct ScriptMetadata {
     scratch_cwd: Option<bool>,
     output: Option<String>,
     error: Option<String>,
+    timeout: Option<u64>,
 }
 
 fn parse_script_metadata(path: &Path) -> Result<ScriptMetadata> {
@@ -126,6 +144,12 @@ fn parse_script_metadata(path: &Path) -> Result<ScriptMetadata> {
             }
             "tri_output" | "tri_out" => metadata.output = Some(value.to_owned()),
             "tri_error" | "tri_err" => metadata.error = Some(value.to_owned()),
+            "tri_timeout" => {
+                metadata.timeout = Some(
+                    parse_timeout(value)
+                        .map_err(|error| anyhow::anyhow!("invalid tri_timeout: {error}"))?,
+                )
+            }
             _ => {}
         }
     }
@@ -163,6 +187,7 @@ async fn main() -> Result<()> {
         cwd,
         output,
         error,
+        timeout,
         command,
     ) = if let Some(script_path) = script {
         let metadata = parse_script_metadata(&script_path)?;
@@ -189,6 +214,7 @@ async fn main() -> Result<()> {
             args.chdir.or(script_cwd),
             args.output.or(metadata.output),
             args.error.or(metadata.error),
+            args.timeout.or(metadata.timeout),
             command,
         )
     } else {
@@ -205,15 +231,19 @@ async fn main() -> Result<()> {
             args.chdir.or(submit_cwd),
             args.output,
             args.error,
+            args.timeout,
             args.command,
         )
     };
 
     eprintln!("submitting {}", command_to_string(&command));
     let response = match client::local(&Request::Submit {
+        request_id: args.request_id,
         spec: TaskSpec {
             name,
             command,
+            external_id: args.external_id,
+            timeout_seconds: timeout,
             requested_cpu,
             requested_mem_bytes,
             requested_gpus,
@@ -234,8 +264,10 @@ async fn main() -> Result<()> {
         Err(error) => return Err(error),
     };
     match response {
-        Response::Task(task) if args.json => tri::output::task_json(&task)?,
-        Response::Task(task) => println!("{}", task.id),
+        Response::Submitted { task, created } if args.json => {
+            tri::output::submission_json(&task, created)?
+        }
+        Response::Submitted { task, .. } => println!("{}", task.id),
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
     Ok(())

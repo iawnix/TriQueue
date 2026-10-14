@@ -22,6 +22,12 @@ tri_clean     remove finished task records
 state, attempt, lease, exit code, and log paths. `tri_log` keeps stdout and
 stderr as raw task output.
 
+Use `--external-id` for a stable workflow task identity and `--request-id` (or
+its `--idempotency-key` alias) when a caller may retry a submission after a
+lost response. Repeating either identifier with the same task specification
+returns the original task; reusing one with a different specification is an
+error. `tri_stat --external-id ID` looks up a task by its workflow identity.
+
 `tri_ls` includes a `TIME` column. It shows elapsed runtime as `HH:MM:SS`
 (or `D-HH:MM:SS` for jobs lasting more than a day); running jobs update on
 each invocation, while waiting jobs show `--`.
@@ -56,7 +62,7 @@ exec /home/iaw/soft/gaussian/bin/gaussian16-run water.gjf water.log
 ```
 
 Submit it with `tri_sub --chdir JOB_DIRECTORY -- ./job.sh`. The supported
-declarations are `tri_name`, `tri_node`, `tri_cpu`, `tri_mem`, `tri_gpu`, `tri_scratch`, `tri_output`,
+declarations are `tri_name`, `tri_node`, `tri_cpu`, `tri_mem`, `tri_gpu`, `tri_scratch`, `tri_timeout`, `tri_output`,
 and `tri_error`; command-line options override values from the script header.
 The short aliases `tri_out` and `tri_err` are also accepted. `-o/--output` and
 `-e/--error` on the command line override the corresponding script settings.
@@ -66,6 +72,11 @@ For example:
 ```bash
 tri_sub --chdir "$PWD" --gpu 1 --scratch-cwd --output result.out --error result.err -- ./job.sh
 ```
+
+Set a native runtime limit with `--timeout SECONDS` (or `# tri_timeout:` in a
+job script). The client applies this as a systemd `RuntimeMaxSec` limit to the
+task cgroup. A task that reaches the limit is reported as `timed_out`, which is
+distinct from `fail`, `cancel`, and `lost`.
 
 Use `--after TASK_ID` to wait for an earlier task to finish successfully;
 repeat it for multiple prerequisites. A prerequisite that fails, is cancelled,

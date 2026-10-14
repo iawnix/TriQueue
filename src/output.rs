@@ -46,6 +46,12 @@ pub fn task(task: &Task) {
     );
     println!("  memory:  {}", format_bytes(task.spec.requested_mem_bytes));
     println!("  gpus:    {}", task.spec.requested_gpus);
+    if let Some(timeout) = task.spec.timeout_seconds {
+        println!("  timeout: {timeout}s");
+    }
+    if let Some(external_id) = &task.external_id {
+        println!("  external: {external_id}");
+    }
     println!(
         "  command: {}",
         crate::command_to_string(&task.spec.command)
@@ -96,7 +102,7 @@ pub fn nodes(nodes: &[NodeInfo]) {
 
 /// Show the scheduler queue and a compact count of every task state.
 pub fn queue(items: &[Task]) {
-    let mut counts = [0usize; 7];
+    let mut counts = [0usize; 8];
     for task in items {
         let index = match &task.state {
             TaskState::Wait => 0,
@@ -106,11 +112,12 @@ pub fn queue(items: &[Task]) {
             TaskState::Cancel => 4,
             TaskState::Lost => 5,
             TaskState::Blocked => 6,
+            TaskState::TimedOut => 7,
         };
         counts[index] += 1;
     }
     println!(
-        "Queue  {} total   {} wait   {} run   {} done   {} fail   {} cancel   {} lost   {} blocked",
+        "Queue  {} total   {} wait   {} run   {} done   {} fail   {} cancel   {} lost   {} blocked   {} timed_out",
         items.len(),
         counts[0],
         counts[1],
@@ -118,7 +125,8 @@ pub fn queue(items: &[Task]) {
         counts[3],
         counts[4],
         counts[5],
-        counts[6]
+        counts[6],
+        counts[7]
     );
     let active: Vec<_> = items
         .iter()
@@ -141,6 +149,7 @@ pub fn colored_state(state: &TaskState) -> String {
         TaskState::Cancel => "cancel".dimmed().to_string(),
         TaskState::Lost => "lost".magenta().bold().to_string(),
         TaskState::Blocked => "blocked".yellow().bold().to_string(),
+        TaskState::TimedOut => "timed_out".red().bold().to_string(),
     }
 }
 
@@ -166,19 +175,42 @@ pub fn tasks_json(tasks: &[Task]) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn submission_json(task: &Task, created: bool) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task": task,
+            "created": created,
+            "deduplicated": !created,
+        }))?
+    );
+    Ok(())
+}
+
 pub fn nodes_json(nodes: &[NodeInfo]) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(nodes)?);
     Ok(())
 }
 
 pub fn json_error(error: &anyhow::Error) -> ! {
+    let message = error.to_string();
+    let (code, retryable) = if message.starts_with("request_id_reused:") {
+        ("request_id_reused", false)
+    } else if message.starts_with("external_id_conflict:") {
+        ("external_id_conflict", false)
+    } else if message.contains("must be greater than zero") || message.contains("must not be empty")
+    {
+        ("invalid_request", false)
+    } else {
+        ("request_failed", true)
+    };
     println!(
         "{}",
         serde_json::json!({
             "error": {
-                "code": "request_failed",
-                "message": error.to_string(),
-                "retryable": true
+                "code": code,
+                "message": message,
+                "retryable": retryable
             }
         })
     );

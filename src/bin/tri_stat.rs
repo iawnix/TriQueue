@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 use tri::client;
 use tri::output;
@@ -9,6 +9,8 @@ use tri::protocol::{Request, Response};
 struct Args {
     /// Show details for one task. Omit it to show the queue.
     id: Option<i64>,
+    #[arg(long, conflicts_with = "id")]
+    external_id: Option<String>,
     #[arg(long, help = "limit the queue view to one state")]
     state: Option<String>,
     #[arg(long)]
@@ -18,9 +20,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let request = match args.id {
-        Some(id) => Request::Get { id },
-        None => Request::List { state: args.state },
+    let request = match (args.id, args.external_id) {
+        (Some(id), None) => Request::Get { id },
+        (None, Some(external_id)) => Request::GetExternal { external_id },
+        (None, None) => Request::List { state: args.state },
+        (Some(_), Some(_)) => bail!("provide either an id or --external-id, not both"),
     };
     let response = match client::local(&request).await {
         Ok(response) => response,

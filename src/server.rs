@@ -74,11 +74,22 @@ impl Server {
 
     pub fn handle(&self, request: Request) -> Result<Response> {
         match request {
-            Request::Submit { spec } => Ok(Response::Task(self.store.submit(spec)?)),
+            Request::Submit { request_id, spec } => {
+                let (task, created) = self
+                    .store
+                    .submit_with_receipt(request_id.as_deref(), spec)?;
+                Ok(Response::Submitted { task, created })
+            }
             Request::List { state } => Ok(Response::Tasks(self.store.list(state.as_deref())?)),
             Request::Get { id } => match self.store.get(id)? {
                 Some(task) => Ok(Response::Task(task)),
                 None => Ok(Response::Error(format!("task {id} does not exist"))),
+            },
+            Request::GetExternal { external_id } => match self.store.get_external(&external_id)? {
+                Some(task) => Ok(Response::Task(task)),
+                None => Ok(Response::Error(format!(
+                    "external_id {external_id:?} does not exist"
+                ))),
             },
             Request::Cancel { id } => {
                 match self.store.cancel(id)? {
@@ -328,6 +339,8 @@ mod tests {
         TaskSpec {
             name: name.into(),
             command: vec!["true".into()],
+            external_id: None,
+            timeout_seconds: None,
             requested_cpu: cpu,
             requested_mem_bytes: 0,
             requested_gpus: 0,
@@ -365,11 +378,12 @@ mod tests {
             .map(|name| {
                 match server
                     .handle(Request::Submit {
+                        request_id: None,
                         spec: spec(name, 2),
                     })
                     .unwrap()
                 {
-                    Response::Task(task) => task.id,
+                    Response::Submitted { task, .. } => task.id,
                     response => panic!("unexpected response: {response:?}"),
                 }
             })

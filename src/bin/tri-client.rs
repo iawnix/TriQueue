@@ -33,6 +33,7 @@ struct LocalTask {
     cpu_count: u32,
     memory_bytes: u64,
     gpu_count: u32,
+    timeout_seconds: Option<u64>,
     scratch: std::path::PathBuf,
 }
 
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
     loop {
         let mut completed = Vec::new();
         for (id, local) in &running {
-            if let Some(result) = poll_task(&local.unit).await? {
+            if let Some(result) = poll_task(&local.unit, local.timeout_seconds).await? {
                 completed.push((*id, result));
             }
         }
@@ -261,6 +262,9 @@ async fn spawn_task(
             "MemorySwapMax=0",
         ]);
     }
+    if let Some(timeout) = task.spec.timeout_seconds {
+        command.args(["--property", &format!("RuntimeMaxSec={timeout}")]);
+    }
     if let Some(client_unit) = client_unit {
         command.args([
             "--property",
@@ -316,11 +320,12 @@ async fn spawn_task(
         cpu_count: task.spec.requested_cpu,
         memory_bytes: task.spec.requested_mem_bytes,
         gpu_count: task.spec.requested_gpus,
+        timeout_seconds: task.spec.timeout_seconds,
         scratch,
     }))
 }
 
-async fn poll_task(unit: &str) -> Result<Option<TaskCompletion>> {
+async fn poll_task(unit: &str, timeout_seconds: Option<u64>) -> Result<Option<TaskCompletion>> {
     let unit = format!("{unit}.service");
     let output = Command::new("systemctl")
         .args([
@@ -371,6 +376,16 @@ async fn poll_task(unit: &str) -> Result<Option<TaskCompletion>> {
             state: TaskState::Fail,
             exit_code: None,
             error: Some("memory limit exceeded (MemoryMax)".into()),
+        }));
+    }
+    if result == "timeout" {
+        return Ok(Some(TaskCompletion {
+            state: TaskState::TimedOut,
+            exit_code: status,
+            error: Some(format!(
+                "task exceeded timeout of {} seconds",
+                timeout_seconds.unwrap_or_default()
+            )),
         }));
     }
     let success = result == "success" && status == Some(0);

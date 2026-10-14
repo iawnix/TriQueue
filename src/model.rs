@@ -12,6 +12,8 @@ pub enum TaskState {
     Cancel,
     Lost,
     Blocked,
+    #[serde(rename = "timed_out")]
+    TimedOut,
 }
 
 impl TaskState {
@@ -24,6 +26,7 @@ impl TaskState {
             Self::Cancel => "cancel",
             Self::Lost => "lost",
             Self::Blocked => "blocked",
+            Self::TimedOut => "timed_out",
         }
     }
 }
@@ -38,6 +41,10 @@ impl std::fmt::Display for TaskState {
 pub struct TaskSpec {
     pub name: String,
     pub command: Vec<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
     pub requested_cpu: u32,
     pub requested_mem_bytes: u64,
     #[serde(default)]
@@ -77,6 +84,8 @@ pub struct Task {
     pub stdout_path: String,
     pub stderr_path: String,
     pub error: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]

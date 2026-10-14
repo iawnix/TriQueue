@@ -4,16 +4,37 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    Submit { spec: TaskSpec },
-    List { state: Option<String> },
-    Get { id: TaskId },
-    Cancel { id: TaskId },
+    Submit {
+        #[serde(default)]
+        request_id: Option<String>,
+        spec: TaskSpec,
+    },
+    List {
+        state: Option<String>,
+    },
+    Get {
+        id: TaskId,
+    },
+    GetExternal {
+        external_id: String,
+    },
+    Cancel {
+        id: TaskId,
+    },
     Nodes,
     Clean,
-    Register { node: NodeRegistration },
-    Heartbeat { heartbeat: NodeHeartbeat },
-    Poll { node: String },
-    Complete { result: TaskResult },
+    Register {
+        node: NodeRegistration,
+    },
+    Heartbeat {
+        heartbeat: NodeHeartbeat,
+    },
+    Poll {
+        node: String,
+    },
+    Complete {
+        result: TaskResult,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -21,11 +42,19 @@ pub enum Request {
 pub enum Response {
     Ok,
     Task(crate::model::Task),
+    Submitted {
+        task: crate::model::Task,
+        created: bool,
+    },
     Tasks(Vec<crate::model::Task>),
     Nodes(Vec<crate::model::NodeInfo>),
     Assignment(Option<crate::model::TaskAssignment>),
-    Heartbeat { cancel: Vec<TaskId> },
+    Heartbeat {
+        cancel: Vec<TaskId>,
+    },
     Message(String),
-    Cleaned { removed: usize },
+    Cleaned {
+        removed: usize,
+    },
     Error(String),
 }

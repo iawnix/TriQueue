@@ -417,6 +417,7 @@ fn state_rank(state: &TaskState) -> u8 {
         TaskState::Cancel => 4,
         TaskState::Done => 5,
         TaskState::Blocked => 6,
+        TaskState::TimedOut => 7,
     }
 }
 fn state_label(state: &TaskState) -> &'static str {
@@ -428,6 +429,7 @@ fn state_label(state: &TaskState) -> &'static str {
         TaskState::Cancel => "× cancel",
         TaskState::Lost => "? lost",
         TaskState::Blocked => "! blocked",
+        TaskState::TimedOut => "! timed out",
     }
 }
 fn task_style(state: &TaskState) -> Style {
@@ -440,6 +442,7 @@ fn task_style(state: &TaskState) -> Style {
             TaskState::Cancel => MUTED,
             TaskState::Lost => Color::Magenta,
             TaskState::Blocked => YELLOW,
+            TaskState::TimedOut => RED,
         })
         .add_modifier(Modifier::BOLD)
 }
