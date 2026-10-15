@@ -24,8 +24,13 @@ async fn main() -> Result<()> {
     };
     match response {
         Response::Nodes(nodes) => {
-            if args.check {
-                check_nodes(&nodes, !args.json)?;
+            if args.check
+                && let Err(error) = check_nodes(&nodes, !args.json)
+            {
+                if args.json {
+                    output::json_error(&error);
+                }
+                return Err(error);
             }
             if args.json {
                 output::nodes_json(&nodes)?;
