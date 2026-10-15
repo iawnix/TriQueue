@@ -326,13 +326,8 @@ async fn spawn_task(
             &format!("NVIDIA_VISIBLE_DEVICES={gpus}"),
         ]);
     }
-    if cpus.is_empty() {
-        command.arg(&task.spec.command[0]);
-        command.args(&task.spec.command[1..]);
-    } else {
-        command.args(["taskset", "-c", cpus, &task.spec.command[0]]);
-        command.args(&task.spec.command[1..]);
-    }
+    command.arg(&task.spec.command[0]);
+    command.args(&task.spec.command[1..]);
     let status = command
         .status()
         .await
