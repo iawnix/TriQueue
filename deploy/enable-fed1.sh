@@ -39,7 +39,7 @@ sed -i \
   -e 's#^TRI_SERVER_ADDR=.*#TRI_SERVER_ADDR=192.168.31.243:7400#' \
   "$HOME/.config/tri/server.env"
 cat > "$HOME/.config/tri/client-fed1.env" <<'EOF'
-TRI_SERVER_ADDR=127.0.0.1:7400
+TRI_SERVER_ADDR=192.168.31.243:7400
 TRI_NODE=fed1
 TRI_NODE_ADDRESS=192.168.31.243
 TRI_NODE_CPUS=24

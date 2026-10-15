@@ -12,6 +12,11 @@ use std::path::PathBuf;
 pub fn socket_path() -> PathBuf {
     std::env::var_os("TRI_SOCKET")
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .map(|runtime| runtime.join("tri/server.sock"))
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp/tri.sock"))
 }
 
