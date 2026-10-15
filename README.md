@@ -14,7 +14,7 @@ tri_log       read stdout/stderr
 tri_del       cancel a task
 tri_node      list nodes
 tri_top       terminal dashboard
-tri_clean     remove finished task records
+tri_clean     remove old finished task records
 ```
 
 `tri_sub`, `tri_ls`, `tri_stat`, `tri_node`, `tri_del`, and `tri_clean` support
@@ -31,6 +31,16 @@ error. `tri_stat --external-id ID` looks up a task by its workflow identity.
 `tri_ls` includes a `TIME` column. It shows elapsed runtime as `HH:MM:SS`
 (or `D-HH:MM:SS` for jobs lasting more than a day); running jobs update on
 each invocation, while waiting jobs show `--`.
+
+`tri_clean` keeps recent terminal task records by default and removes records
+older than 30 days. Use `--older-than SECONDS` to choose a retention window;
+use `--all` only when you intentionally want to remove all terminal records.
+Cleaning also removes the associated idempotency receipt, so a later retry of
+an old request may create a new task.
+
+The client and server perform a protocol `Hello` exchange before every request.
+It checks the protocol version and exposes the server capability set, so a
+stale binary fails with a clear version error instead of a JSON decode error.
 
 The task ID is a monotonically increasing integer. A submitted command is
 stored in SQLite on the server. By default, stdout and stderr are merged into
@@ -83,6 +93,11 @@ repeat it for multiple prerequisites. A prerequisite that fails, is cancelled,
 or is lost blocks the dependent task. Use `--max-attempts N` to requeue a task
 after a node lease expires. The default is one attempt, so jobs with side
 effects are not duplicated unless requested.
+
+Run `tri_node --check` to verify that registered nodes are online and expose
+the systemd user manager, cgroup v2, and CPU/memory controllers required by the
+client. GPU nodes also report the discovered GPU device paths in their
+capabilities.
 
 A complete scratch-based job can look like this:
 
@@ -196,6 +211,10 @@ data through `/home/iaw/DATA`, which is a symlink to the local mount point
 `/DATA`; on FED2 that mount point is the NFS filesystem. Keep the SQLite
 database on FED1's local filesystem; only task inputs, outputs, and logs belong
 on the shared data path.
+
+The TCP control endpoint should bind to FED1's private address and the firewall
+should allow port 7400 only from registered compute nodes. Local commands use
+the Unix socket, so they do not need the TCP endpoint.
 
 The user-level binaries and services can be installed without root. To finish
 machine setup, run `deploy/enable-fed1.sh` as `iaw` on FED1 and

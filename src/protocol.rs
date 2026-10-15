@@ -1,9 +1,30 @@
 use crate::model::{NodeHeartbeat, NodeRegistration, ObservedUnit, TaskId, TaskResult, TaskSpec};
 use serde::{Deserialize, Serialize};
 
+pub const PROTOCOL_VERSION: u32 = 1;
+
+pub fn capabilities() -> Vec<String> {
+    [
+        "submission_idempotency",
+        "external_id",
+        "timeouts",
+        "task_dependencies",
+        "task_reconciliation",
+        "cgroup_limits",
+        "node_capabilities",
+        "retention_clean",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
+    Hello {
+        protocol_version: u32,
+    },
     Submit {
         #[serde(default)]
         request_id: Option<String>,
@@ -22,7 +43,10 @@ pub enum Request {
         id: TaskId,
     },
     Nodes,
-    Clean,
+    Clean {
+        #[serde(default)]
+        older_than_seconds: Option<u64>,
+    },
     Register {
         node: NodeRegistration,
     },
@@ -44,6 +68,10 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
+    Hello {
+        protocol_version: u32,
+        capabilities: Vec<String>,
+    },
     Ok,
     Task(crate::model::Task),
     Submitted {

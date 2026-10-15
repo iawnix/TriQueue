@@ -110,6 +110,8 @@ pub struct NodeInfo {
     #[serde(default)]
     pub gpu_used: u32,
     pub running_tasks: Vec<TaskId>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +136,8 @@ pub struct NodeRegistration {
     pub scratch: String,
     #[serde(default)]
     pub gpu_devices: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

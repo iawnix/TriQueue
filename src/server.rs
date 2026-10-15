@@ -1,5 +1,5 @@
 use crate::model::{NodeHeartbeat, NodeInfo, NodeRegistration, TaskId, TaskState};
-use crate::protocol::{Request, Response};
+use crate::protocol::{PROTOCOL_VERSION, Request, Response, capabilities};
 use crate::store::{DependencyStatus, LEASE_SECONDS, Store};
 use crate::{socket_path, tcp_addr};
 use anyhow::{Context, Result};
@@ -74,6 +74,16 @@ impl Server {
 
     pub fn handle(&self, request: Request) -> Result<Response> {
         match request {
+            Request::Hello { protocol_version } => {
+                anyhow::ensure!(
+                    protocol_version == PROTOCOL_VERSION,
+                    "protocol version mismatch: client={protocol_version}, server={PROTOCOL_VERSION}"
+                );
+                Ok(Response::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: capabilities(),
+                })
+            }
             Request::Submit { request_id, spec } => {
                 let (task, created) = self
                     .store
@@ -104,8 +114,8 @@ impl Server {
                 let nodes = self.nodes.lock().expect("nodes mutex poisoned");
                 Ok(Response::Nodes(nodes.values().cloned().collect()))
             }
-            Request::Clean => Ok(Response::Cleaned {
-                removed: self.store.clean()?,
+            Request::Clean { older_than_seconds } => Ok(Response::Cleaned {
+                removed: self.store.clean(older_than_seconds)?,
             }),
             Request::Register { node } => {
                 self.register(node);
@@ -135,6 +145,7 @@ impl Server {
             existing.memory_bytes = node.memory_bytes;
             existing.gpu_total = node.gpu_total;
             existing.scratch = node.scratch;
+            existing.capabilities = node.capabilities;
             existing.online = true;
             existing.last_seen = crate::now_string();
         } else {
@@ -153,6 +164,7 @@ impl Server {
                     memory_used: 0,
                     gpu_used: 0,
                     running_tasks: Vec::new(),
+                    capabilities: node.capabilities,
                 },
             );
         }
@@ -400,6 +412,7 @@ mod tests {
                     gpu_total: 0,
                     scratch: PathBuf::from("/tmp").to_string_lossy().into_owned(),
                     gpu_devices: Vec::new(),
+                    capabilities: Vec::new(),
                 },
             })
             .unwrap();
@@ -470,20 +483,69 @@ where
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    if line.trim().is_empty() {
+    let Some(first_request) = read_request(&mut reader).await? else {
+        return Ok(());
+    };
+    let Request::Hello { protocol_version } = first_request else {
+        write_response(
+            &mut writer,
+            &Response::Error("protocol hello required as the first request".into()),
+        )
+        .await?;
+        return Ok(());
+    };
+    if protocol_version != PROTOCOL_VERSION {
+        write_response(
+            &mut writer,
+            &Response::Error(format!(
+                "protocol version mismatch: client={protocol_version}, server={PROTOCOL_VERSION}"
+            )),
+        )
+        .await?;
         return Ok(());
     }
-    let response = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(request) => match server.handle(request) {
+    write_response(
+        &mut writer,
+        &Response::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: capabilities(),
+        },
+    )
+    .await?;
+    while let Some(request) = read_request(&mut reader).await? {
+        let response = match server.handle(request) {
             Ok(response) => response,
             Err(error) => Response::Error(error.to_string()),
-        },
-        Err(error) => Response::Error(format!("invalid request: {error}")),
-    };
+        };
+        write_response(&mut writer, &response).await?;
+    }
+    Ok(())
+}
+
+async fn read_request<R>(reader: &mut BufReader<R>) -> Result<Option<Request>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(None);
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        return Ok(Some(
+            serde_json::from_str(line.trim()).context("invalid request")?,
+        ));
+    }
+}
+
+async fn write_response<W>(writer: &mut W, response: &Response) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     writer
-        .write_all((serde_json::to_string(&response)? + "\n").as_bytes())
+        .write_all((serde_json::to_string(response)? + "\n").as_bytes())
         .await?;
     writer.flush().await?;
     Ok(())

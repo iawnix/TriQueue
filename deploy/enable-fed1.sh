@@ -34,7 +34,10 @@ sudo firewall-cmd --reload
 sudo loginctl enable-linger iaw
 
 mkdir -p "$HOME/.config/tri"
-sed -i 's#^TRI_DATA_DIR=.*#TRI_DATA_DIR=/home/iaw/DATA/tri#' "$HOME/.config/tri/server.env"
+sed -i \
+  -e 's#^TRI_DATA_DIR=.*#TRI_DATA_DIR=/home/iaw/DATA/tri#' \
+  -e 's#^TRI_SERVER_ADDR=.*#TRI_SERVER_ADDR=192.168.31.243:7400#' \
+  "$HOME/.config/tri/server.env"
 cat > "$HOME/.config/tri/client-fed1.env" <<'EOF'
 TRI_SERVER_ADDR=127.0.0.1:7400
 TRI_NODE=fed1

@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
         gpu_total: args.gpus,
         scratch: args.scratch.clone(),
         gpu_devices: gpu_devices.clone(),
+        capabilities: node_capabilities(&gpu_devices),
     };
 
     loop {
@@ -216,6 +217,37 @@ async fn main() -> Result<()> {
         }
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn node_capabilities(gpu_devices: &[String]) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    let cgroup_controllers = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").ok();
+    if cgroup_controllers.is_some() {
+        capabilities.push("cgroup_v2".to_owned());
+    }
+    if let Some(controllers) = cgroup_controllers {
+        for controller in ["cpuset", "cpu", "memory"] {
+            if controllers
+                .split_whitespace()
+                .any(|item| item == controller)
+            {
+                capabilities.push(format!("cgroup:{controller}"));
+            }
+        }
+    }
+    if std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        capabilities.push("systemd_user".to_owned());
+    }
+    for device in gpu_devices {
+        if std::path::Path::new(device).exists() {
+            capabilities.push(format!("gpu_device:{device}"));
+        }
+    }
+    capabilities
 }
 
 async fn spawn_task(

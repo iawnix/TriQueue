@@ -330,13 +330,23 @@ impl Store {
         self.get(result.id)
     }
 
-    pub fn clean(&self) -> Result<usize> {
+    pub fn clean(&self, older_than_seconds: Option<u64>) -> Result<usize> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
-        let removed = tx.execute(
-            "DELETE FROM tasks WHERE state IN ('done','fail','cancel','lost','blocked','timed_out')",
-            [],
-        )?;
+        let removed = if let Some(age) = older_than_seconds {
+            let cutoff = crate::now_seconds().saturating_sub(age).to_string();
+            tx.execute(
+                "DELETE FROM tasks
+                 WHERE state IN ('done','fail','cancel','lost','blocked','timed_out')
+                   AND finished_at IS NOT NULL AND CAST(finished_at AS INTEGER) < CAST(?1 AS INTEGER)",
+                params![cutoff],
+            )?
+        } else {
+            tx.execute(
+                "DELETE FROM tasks WHERE state IN ('done','fail','cancel','lost','blocked','timed_out')",
+                [],
+            )?
+        };
         tx.execute(
             "DELETE FROM submission_receipts WHERE task_id NOT IN (SELECT id FROM tasks)",
             [],
@@ -959,6 +969,38 @@ mod tests {
             .unwrap();
         assert_eq!(finished.state, TaskState::TimedOut);
         assert_eq!(finished.spec.timeout_seconds, Some(1));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_retains_recent_terminal_tasks_until_explicitly_requested() {
+        let root = std::env::temp_dir().join(format!("tri-retention-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
+        let task = store
+            .submit(TaskSpec {
+                name: "retention".into(),
+                command: vec!["true".into()],
+                external_id: None,
+                timeout_seconds: None,
+                requested_cpu: 1,
+                requested_mem_bytes: 0,
+                requested_gpus: 0,
+                scratch_cwd: false,
+                requested_node: None,
+                cwd: None,
+                env: Vec::new(),
+                output_path: None,
+                error_path: None,
+                depends_on: Vec::new(),
+                max_attempts: 1,
+            })
+            .unwrap();
+        store.cancel(task.id).unwrap();
+        assert_eq!(store.clean(Some(u64::MAX)).unwrap(), 0);
+        assert_eq!(store.list(None).unwrap().len(), 1);
+        assert_eq!(store.clean(None).unwrap(), 1);
+        assert!(store.list(None).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }

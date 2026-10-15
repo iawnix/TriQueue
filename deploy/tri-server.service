@@ -10,7 +10,7 @@ Group=iaw
 RuntimeDirectory=tri
 StateDirectory=tri
 Environment=TRI_SOCKET=/run/tri/server.sock
-Environment=TRI_SERVER_ADDR=0.0.0.0:7400
+Environment=TRI_SERVER_ADDR=192.168.31.243:7400
 Environment=TRI_DATA_DIR=/home/iaw/DATA/tri
 Environment=TRI_DB=/var/lib/tri/tri.db
 ExecStart=/usr/local/bin/tri-server
