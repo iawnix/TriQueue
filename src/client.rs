@@ -30,6 +30,7 @@ where
 {
     let hello = serde_json::to_string(&Request::Hello {
         protocol_version: PROTOCOL_VERSION,
+        auth_token: std::env::var("TRI_AUTH_TOKEN").ok(),
     })? + "\n";
     let message = serde_json::to_string(request)? + "\n";
     stream.write_all(hello.as_bytes()).await?;

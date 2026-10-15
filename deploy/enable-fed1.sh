@@ -38,6 +38,10 @@ sed -i \
   -e 's#^TRI_DATA_DIR=.*#TRI_DATA_DIR=/home/iaw/DATA/tri#' \
   -e 's#^TRI_SERVER_ADDR=.*#TRI_SERVER_ADDR=192.168.31.243:7400#' \
   "$HOME/.config/tri/server.env"
+if ! grep -q '^TRI_AUTH_TOKEN=' "$HOME/.config/tri/server.env"; then
+  printf 'TRI_AUTH_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "$HOME/.config/tri/server.env"
+fi
+auth_token=$(sed -n 's/^TRI_AUTH_TOKEN=//p' "$HOME/.config/tri/server.env")
 cat > "$HOME/.config/tri/client-fed1.env" <<'EOF'
 TRI_SERVER_ADDR=192.168.31.243:7400
 TRI_NODE=fed1
@@ -48,6 +52,7 @@ TRI_NODE_GPUS=1
 TRI_NODE_GPU_DEVICES=/dev/nvidia0
 TRI_NODE_SCRATCH=/home/iaw/scratch
 EOF
+printf 'TRI_AUTH_TOKEN=%s\n' "$auth_token" >> "$HOME/.config/tri/client-fed1.env"
 cat > "$HOME/.config/systemd/user/tri-client-fed1.service" <<'EOF'
 [Unit]
 Description=tri compute client on FED1

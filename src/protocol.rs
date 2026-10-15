@@ -24,6 +24,8 @@ pub fn capabilities() -> Vec<String> {
 pub enum Request {
     Hello {
         protocol_version: u32,
+        #[serde(default)]
+        auth_token: Option<String>,
     },
     Submit {
         #[serde(default)]

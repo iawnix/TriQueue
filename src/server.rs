@@ -32,6 +32,14 @@ impl Server {
             .with_context(|| format!("binding Unix socket {}", socket.display()))?;
         let tcp = TcpListener::bind(tcp_addr()).await?;
         tracing::info!(socket = %socket.display(), "tri-server ready");
+        let auth_token = std::env::var("TRI_AUTH_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty());
+        if auth_token.is_none() {
+            tracing::warn!(
+                "TCP authentication is disabled; set TRI_AUTH_TOKEN for client authentication"
+            );
+        }
 
         let reaper = self.clone();
         tokio::spawn(async move {
@@ -51,7 +59,7 @@ impl Server {
                     Ok((stream, _)) => {
                         let server = unix_server.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = handle_stream(server, stream).await {
+                            if let Err(error) = handle_stream(server, stream, false, None).await {
                                 tracing::warn!(%error, "Unix request failed");
                             }
                         });
@@ -64,8 +72,9 @@ impl Server {
         loop {
             let (stream, peer) = tcp.accept().await?;
             let server = self.clone();
+            let auth_token = auth_token.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_stream(server, stream).await {
+                if let Err(error) = handle_stream(server, stream, true, auth_token).await {
                     tracing::warn!(%peer, %error, "TCP request failed");
                 }
             });
@@ -74,7 +83,9 @@ impl Server {
 
     pub fn handle(&self, request: Request) -> Result<Response> {
         match request {
-            Request::Hello { protocol_version } => {
+            Request::Hello {
+                protocol_version, ..
+            } => {
                 anyhow::ensure!(
                     protocol_version == PROTOCOL_VERSION,
                     "protocol version mismatch: client={protocol_version}, server={PROTOCOL_VERSION}"
@@ -477,7 +488,12 @@ mod tests {
     }
 }
 
-async fn handle_stream<S>(server: Server, stream: S) -> Result<()>
+async fn handle_stream<S>(
+    server: Server,
+    stream: S,
+    require_auth: bool,
+    expected_token: Option<String>,
+) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -486,7 +502,11 @@ where
     let Some(first_request) = read_request(&mut reader).await? else {
         return Ok(());
     };
-    let Request::Hello { protocol_version } = first_request else {
+    let Request::Hello {
+        protocol_version,
+        auth_token,
+    } = first_request
+    else {
         write_response(
             &mut writer,
             &Response::Error("protocol hello required as the first request".into()),
@@ -504,11 +524,23 @@ where
         .await?;
         return Ok(());
     }
+    if require_auth && expected_token.as_deref() != auth_token.as_deref() {
+        write_response(
+            &mut writer,
+            &Response::Error("authentication failed".into()),
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut server_capabilities = capabilities();
+    if expected_token.is_some() {
+        server_capabilities.push("tcp_auth_token".into());
+    }
     write_response(
         &mut writer,
         &Response::Hello {
             protocol_version: PROTOCOL_VERSION,
-            capabilities: capabilities(),
+            capabilities: server_capabilities,
         },
     )
     .await?;

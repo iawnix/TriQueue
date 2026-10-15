@@ -42,6 +42,10 @@ The client and server perform a protocol `Hello` exchange before every request.
 It checks the protocol version and exposes the server capability set, so a
 stale binary fails with a clear version error instead of a JSON decode error.
 
+Set the same random `TRI_AUTH_TOKEN` in the server environment and every
+compute client environment to authenticate TCP requests. Unix-socket requests
+remain protected by the local socket permissions and do not require the token.
+
 The task ID is a monotonically increasing integer. A submitted command is
 stored in SQLite on the server. By default, stdout and stderr are merged into
 `tri-<id>.out` in the job working directory. Use `--output PATH` and

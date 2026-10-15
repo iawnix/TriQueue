@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+EnvironmentFile=-%h/.config/tri/server.env
 User=iaw
 Group=iaw
 RuntimeDirectory=tri

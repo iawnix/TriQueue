@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+EnvironmentFile=%h/.config/tri/client.env
 Type=simple
 User=iaw
 Group=iaw
