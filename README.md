@@ -20,13 +20,14 @@ so you can start with one machine and add nodes later.
 ## Requirements and scope
 
 TriQueue is intended for a trusted environment where tasks run as the account
-running the compute client. It does not provide per-user isolation or transfer
+selected for task execution (the compute client's account in user mode). It does not provide per-user isolation or transfer
 scripts, software, inputs, or results between machines.
 
 To run tasks, each compute node needs:
 
-- Linux with systemd and a working systemd user manager.
-- cgroup v2 with CPU, cpuset, and memory controllers available to the user manager.
+- Linux with systemd and cgroup v2 CPU, cpuset, and memory controllers.
+- A [system-managed compute client](docs/deployment.md#system-managed-compute-client-recommended),
+  or a user manager with delegated controllers and working device enforcement.
 - The programs and files used by your jobs. For multiple nodes, use consistent
   absolute paths and shared storage such as NFS where needed.
 
@@ -55,7 +56,9 @@ SQLite is bundled with the build; a separate database server is not required.
 
 This example runs a server and a CPU-only compute client on the same machine.
 Use three terminals under the same Linux account, with the installed binaries
-on `PATH`. It uses port 7400; choose another port consistently if it is in use.
+on `PATH`. First run `tri-client --check` to verify that this host can enforce
+limits in user mode. If it fails, use the [system-managed deployment](docs/deployment.md#system-managed-compute-client-recommended).
+It uses port 7400; choose another port consistently if it is in use.
 Use an account that is not already running a TriQueue compute client: clients
 under the same account share a systemd task-unit namespace, even across queues.
 

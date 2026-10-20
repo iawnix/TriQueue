@@ -14,7 +14,7 @@ struct Args {
     name: Option<String>,
     #[arg(long)]
     cpu: Option<u32>,
-    #[arg(long, value_parser = parse_bytes)]
+    #[arg(long, value_parser = parse_bytes, help = "memory reservation and limit (default: 1G)")]
     mem: Option<u64>,
     #[arg(long)]
     gpu: Option<u32>,
@@ -207,7 +207,9 @@ async fn main() -> Result<()> {
         (
             args.name.or(metadata.name).unwrap_or(script_name),
             args.cpu.or(metadata.cpu).unwrap_or(1),
-            args.mem.or(metadata.mem).unwrap_or(0),
+            args.mem
+                .or(metadata.mem)
+                .unwrap_or(tri::resources::DEFAULT_MEMORY_BYTES),
             args.gpu.or(metadata.gpu).unwrap_or(0),
             args.scratch_cwd.or(metadata.scratch_cwd).unwrap_or(false),
             args.node.or(metadata.node),
@@ -224,7 +226,7 @@ async fn main() -> Result<()> {
         (
             args.name.unwrap_or_else(|| "task".to_owned()),
             args.cpu.unwrap_or(1),
-            args.mem.unwrap_or(0),
+            args.mem.unwrap_or(tri::resources::DEFAULT_MEMORY_BYTES),
             args.gpu.unwrap_or(0),
             args.scratch_cwd.unwrap_or(false),
             args.node,

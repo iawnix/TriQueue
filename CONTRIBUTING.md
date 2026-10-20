@@ -18,7 +18,9 @@ cancellation. The cancellation integration test uses fake systemd commands;
 it does not establish that resource controls work on your host. For runtime
 changes, also follow the [quick start](README.md#run-your-first-task) on a host
 with a working systemd user manager and cgroup v2. Validate GPU changes on
-suitable hardware.
+suitable hardware. `tri-client --check` probes user-mode enforcement without
+joining a queue. System-managed enforcement additionally requires validation
+as root with `--task-user ACCOUNT --check` and representative queue tasks.
 
 ## Find your way around
 
@@ -31,7 +33,8 @@ suitable hardware.
 | `src/client.rs` | Connections and protocol exchange |
 | `src/output.rs`, `src/tui.rs` | Command output and dashboard |
 | `tests/` | Integration tests |
-| `deploy/user/` | Generic systemd user service templates |
+| `src/resources.rs` | Kernel limit verification and guarded execution |
+| `deploy/user/`, `deploy/system/` | User and system service templates |
 | `docs/` | User, deployment, and reference documentation |
 
 ## Submit a change

@@ -60,7 +60,70 @@ Unix-socket requests rely on filesystem access rather than the token. Keep
 the socket inside a private runtime directory. If a configured socket exists
 but cannot be opened, CLI tools report an error rather than falling back to TCP.
 
-## Install systemd user services
+## System-managed compute client (recommended)
+
+For reliable CPU, memory, and GPU device enforcement, run the compute client
+as a root-owned system service and choose a non-root task account with
+`TRI_TASK_USER`. The client asks the system manager to create task units with
+`User=ACCOUNT`. Calculations, scratch preparation, cleanup, and log writes
+run as that account. The server and CLI can continue running as ordinary users.
+This remains a queue for trusted callers; it is not a multi-user security system.
+
+Build and install matching CLI/server binaries first. Build the release client
+on each compute node, then prepare a client environment file as shown in the
+user-service section below:
+
+```bash
+cargo build --release --locked --bins
+```
+
+After draining active tasks, install the system client using the task account
+and the existing client environment file. For example, replace `worker` and
+the file path with your own:
+
+```bash
+sudo bash deploy/install-system-client.sh worker /home/worker/.config/tri/client.env
+```
+
+The installer checks actual resource enforcement from a temporary system
+service before switching services,
+installs a root-owned binary at `/usr/local/bin/tri-client`, copies the
+configuration to `/etc/tri/client.env` with mode `600`, sets `TRI_TASK_USER`,
+and installs [`deploy/system/tri-client.service`](../deploy/system/tri-client.service).
+It refuses to switch while task units exist, stops and disables old compute
+user services, and starts the system compute client. It leaves the server
+and user manager running. For an existing system client, drain tasks before
+rerunning the installer; it stops the client after the new check passes and
+rechecks for tasks before replacing it. Review local service
+customizations before replacing an existing unit.
+
+On SELinux hosts, the installer stages the check under `/usr/local/bin` and
+restores the default file labels before execution. SELinux remains enabled;
+the installer does not add policy exceptions for files in home directories.
+
+The source environment file must use systemd `EnvironmentFile` syntax and must
+be trusted by the administrator. Each compute host needs its own unique node
+name, actual capacities, scratch path, server address, and authentication token.
+Use one compute client per host/system manager to avoid task-unit name collisions.
+
+Check the host independently of the queue with:
+
+```bash
+sudo /usr/local/bin/tri-client --task-user worker --check
+systemctl status tri-client.service
+journalctl -u tri-client.service -n 100
+```
+
+Then run `tri_node --check` and a representative task through the queue.
+Normal interactive shell commands remain outside task cgroups.
+
+## Install systemd user services (requires delegated controls)
+
+User mode requires both delegated CPU/memory controls and effective device
+access enforcement. Some hosts cannot apply GPU device policies from a user
+manager; use the system-managed mode above when the probe fails. Run
+`tri-client --check` before enabling a user client. CPU-only nodes still require
+cpuset delegation; GPU-equipped nodes must deny GPU access to CPU-only jobs.
 
 The generic templates in [`deploy/user/`](../deploy/user/) run under the current
 account and expect Cargo-installed binaries at `%h/.cargo/bin/`. Adjust
@@ -145,9 +208,9 @@ tri_node --check
 tri_node --json
 ```
 
-`tri_node --check` verifies reported availability of the user manager and
-controllers. It does not prove that every resource limit can be enforced;
-run a representative job before relying on a node for production work.
+`tri_node --check` requires reported controller availability and a successful
+runtime resource probe. Each task also verifies its actual limits before its
+command starts. Run representative jobs to validate hardware-specific behavior.
 
 ## Compute-node configuration
 
@@ -161,18 +224,26 @@ device paths are `/dev/nvidia0`, `/dev/nvidia1`, and so on. Override these with
 a comma-separated `TRI_NODE_GPU_DEVICES` list when needed. The list must contain
 at least as many entries as the configured GPU count.
 
-Tasks run in transient systemd user units named `tri-task-<id>-<attempt>`.
+Tasks run in transient systemd units named `tri-task-<id>-<attempt>` in the
+selected user or system manager.
 The client applies CPU sets with `AllowedCPUs`, memory limits with `MemoryMax`
 and `MemorySwapMax=0`, and timeouts with `RuntimeMaxSec`. GPU jobs also configure
 device rules. Controller delegation and device-rule support depend on the host;
-check job and systemd logs if a unit cannot apply these properties.
+check job and systemd logs if a unit cannot apply these properties. GPU capability
+paths are expanded to concrete device nodes; filesystem wildcards are not used
+in `DeviceAllow` entries.
 
 ## Upgrades and recovery
 
 Back up the local database before upgrades, using SQLite's backup facilities
 or a copy made with the server stopped. Deploy server, CLI, and compute-client
 binaries from the same revision. The server migrates existing database schemas
-on startup. Protocol negotiation rejects version mismatches, but matching
+on startup. Drain jobs before adopting guarded execution: active legacy units
+without a verification guard will be stopped on reconciliation, and old queued
+tasks with zero memory must be cancelled and resubmitted with a positive memory
+reservation. Old zero-memory idempotency fingerprints do not match the new
+1 GiB default; inspect the original task rather than blindly retrying submissions
+with changed identifiers. Protocol negotiation rejects version mismatches, but matching
 protocol versions alone do not guarantee every optional capability is present.
 
 On startup or reconnect, a client reconciles existing task units with the
@@ -191,9 +262,10 @@ expiry, retry behavior, and cancellation migration details.
 | CLI cannot connect | Server status, matching `TRI_SOCKET`, or TCP address and firewall when no socket exists |
 | Authentication fails | Identical nonempty `TRI_AUTH_TOKEN` values on both ends of TCP connections |
 | No nodes are registered | Client service logs, server reachability, and authentication |
-| `tri_node --check` fails | systemd user manager, cgroup v2, and CPU/cpuset/memory controller availability |
+| `tri_node --check` fails | Run `tri-client --check` on that node; inspect actual delegation and device enforcement, or use system-managed execution |
 | Task stays in `wait` | Requested node, resource capacity, prerequisites, and node availability |
 | Task fails to start | Task `error`, unit logs, working directory, executable paths, and permissions |
+| Task exits with code 78 | Task stderr explains which resource limit failed verification; the command was not started |
 | Logs cannot be read | The recorded path exists and is accessible on the CLI host |
 | Protocol version mismatch | Install matching revisions of the server, clients, and CLI tools |
 
@@ -207,7 +279,8 @@ journalctl --user -u tri-client.service -n 100
 ```
 
 For a task, inspect `tri_stat TASK_ID` and its output. If needed, inspect the
-corresponding `tri-task-TASK_ID-ATTEMPT` user unit in the journal. Set
+corresponding `tri-task-TASK_ID-ATTEMPT` unit in the selected manager's journal.
+For system-managed tasks, omit `--user` from service diagnostic commands. Set
 `RUST_LOG=tri=debug` in the service environment to increase application logging.
 
 ## Original cluster examples

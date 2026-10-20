@@ -26,7 +26,8 @@ Command-line flags override their corresponding environment variables.
 
 | Variable | Flag | Default |
 | --- | --- | --- |
-| `TRI_NODE` | `--name` | Required |
+| `TRI_NODE` | `--name` | Required, except with `--check` |
+| `TRI_TASK_USER` | `--task-user` | Unset: user manager; set: root client with system units running as this non-root account |
 | `TRI_NODE_ADDRESS` | `--address` | `unknown` (informational node address) |
 | `TRI_NODE_CPUS` | `--cpus` | `1` |
 | `TRI_NODE_MEMORY` | `--memory` | `1G` |
@@ -48,8 +49,9 @@ suffixes use powers of 1024. GPU device lists are comma-separated.
 | `CUDA_VISIBLE_DEVICES` | Assigned GPU indexes for GPU tasks |
 | `NVIDIA_VISIBLE_DEVICES` | Assigned GPU indexes for GPU tasks |
 
-Use `tri_sub --env KEY=VALUE` for additional variables. `TMPDIR` is not set
-automatically; a script can set it to `TRI_SCRATCH`.
+`TMPDIR` is set to `TRI_SCRATCH`. Use `tri_sub --env KEY=VALUE` for additional
+variables. Task-supplied variables are applied after resource verification;
+GPU visibility variables are set from the scheduler's assignment.
 
 ## Task states
 
@@ -156,10 +158,30 @@ against the server's current attempts. It adopts matching active attempts and
 stops obsolete units. Lease expiry and retries do not provide exactly-once
 execution: an unreachable node may still be running an old process.
 
-CPU assignments use systemd `AllowedCPUs`. Tasks with `--mem` use `MemoryMax`
-and disable swap for the task cgroup; without `--mem`, there is no task-specific
-memory limit. GPU assignments use device rules and visibility variables.
-Systemd `RuntimeMaxSec` enforces a requested runtime limit.
+CPU assignments use systemd `AllowedCPUs`. Every new task reserves memory and
+uses `MemoryMax` with swap disabled; omitted or zero memory requests become
+1 GiB at submission, before scheduling and idempotency fingerprinting. GPU
+assignments use device rules and visibility variables. The device allowlist
+also applies to tasks with zero GPUs. Systemd `RuntimeMaxSec` enforces a
+requested runtime limit.
+
+A guard runs inside the task unit before executing the command. It verifies
+`cpuset.cpus.effective`, `memory.max`, and `memory.swap.max`, checks access to
+assigned GPU devices, and verifies that unallocated GPU device nodes cannot
+be opened. Verification failure prevents the command from running and returns
+exit code 78; details are in task stderr. Task commands should avoid reserving
+exit code 78 for unrelated errors, since it is reported as an enforcement failure.
+
+`tri-client --check` runs a short-lived CPU-only probe through the configured
+manager. Only a successful probe advertises `resource_enforcement`, which is
+required by `tri_node --check`. With `--task-user ACCOUNT`, the probe uses a
+system unit running under that account. Otherwise it uses a user unit, and
+controller detection reads the user manager's delegated cgroup, not the host
+root. Restart the client to refresh capabilities after host configuration changes.
+
+On reconciliation, active units must have been started through the guard and
+must still have matching CPU and memory constraints. Unsafe legacy units are
+stopped, with their reservation retained until stopping is acknowledged.
 
 ## Protocol compatibility
 

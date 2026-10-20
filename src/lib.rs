@@ -2,6 +2,7 @@ pub mod client;
 pub mod model;
 pub mod output;
 pub mod protocol;
+pub mod resources;
 pub mod server;
 pub mod store;
 pub mod tui;

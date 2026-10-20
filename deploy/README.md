@@ -1,7 +1,10 @@
 # Deployment files
 
 For a new installation, follow the [deployment guide](../docs/deployment.md)
-and use the generic systemd user service templates in [`user/`](user/).
+and choose the system-managed compute client in [`system/`](system/) for
+resource enforcement. [`install-system-client.sh`](install-system-client.sh)
+installs it after a successful runtime check. User service templates in
+[`user/`](user/) require delegated controllers and effective device policies.
 
 ## Original FED1/FED2 deployment
 

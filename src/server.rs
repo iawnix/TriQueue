@@ -418,7 +418,7 @@ mod tests {
                     name: "fed1".into(),
                     address: "local".into(),
                     cpu_total: 4,
-                    memory_bytes: 1024,
+                    memory_bytes: 4 << 30,
                     gpu_total: 0,
                     scratch: PathBuf::from("/tmp").to_string_lossy().into_owned(),
                     gpu_devices: Vec::new(),
@@ -540,6 +540,34 @@ mod tests {
             Response::Nodes(mut nodes) => nodes.remove(0),
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_memory_is_reserved_before_scheduling_another_task() {
+        let (server, root) = test_server("default-memory-reservation");
+        server
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("fed1")
+            .unwrap()
+            .memory_bytes = crate::resources::DEFAULT_MEMORY_BYTES;
+        let first = submit_resources(&server, "first", 1, 0, 0);
+        submit_resources(&server, "second", 1, 0, 0);
+        assert_eq!(
+            first.spec.requested_mem_bytes,
+            crate::resources::DEFAULT_MEMORY_BYTES
+        );
+        assert_eq!(poll_assignment(&server).unwrap().task.id, first.id);
+        assert_eq!(
+            node_view(&server).memory_used,
+            crate::resources::DEFAULT_MEMORY_BYTES
+        );
+        assert!(
+            poll_assignment(&server).is_none(),
+            "default memory must prevent overcommit"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

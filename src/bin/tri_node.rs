@@ -46,19 +46,26 @@ async fn main() -> Result<()> {
 fn check_nodes(nodes: &[tri::model::NodeInfo], print_ok: bool) -> Result<()> {
     anyhow::ensure!(!nodes.is_empty(), "no nodes are registered");
     let required = [
-        "systemd_user",
         "cgroup_v2",
         "cgroup:cpuset",
         "cgroup:cpu",
         "cgroup:memory",
+        "resource_enforcement",
     ];
     let mut failed = false;
     for node in nodes {
-        let missing = required
+        let mut missing = required
             .iter()
             .filter(|capability| !node.capabilities.iter().any(|item| item == **capability))
             .copied()
             .collect::<Vec<_>>();
+        if !node
+            .capabilities
+            .iter()
+            .any(|item| item == "systemd_user" || item == "systemd_system")
+        {
+            missing.push("systemd_manager");
+        }
         if !node.online || !missing.is_empty() {
             failed = true;
             eprintln!(

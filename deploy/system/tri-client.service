@@ -1,0 +1,16 @@
+[Unit]
+Description=TriQueue compute client (system resource enforcement)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The client manages system units; TRI_TASK_USER selects a non-root job account.
+EnvironmentFile=/etc/tri/client.env
+ExecStart=/usr/local/bin/tri-client
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

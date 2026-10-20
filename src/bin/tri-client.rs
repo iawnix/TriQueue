@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep};
 use tri::client;
@@ -13,8 +14,14 @@ use tri::{init_logging, parse_bytes};
 #[derive(Debug, Parser)]
 #[command(name = "tri-client", about = "tri compute-node client")]
 struct Args {
-    #[arg(long, env = "TRI_NODE")]
-    name: String,
+    #[arg(long, env = "TRI_NODE", required_unless_present = "check")]
+    name: Option<String>,
+    /// Verify resource enforcement in a temporary unit, without joining a queue.
+    #[arg(long)]
+    check: bool,
+    /// Run task units through the system manager as this non-root account (client requires root).
+    #[arg(long, env = "TRI_TASK_USER")]
+    task_user: Option<String>,
     #[arg(long, env = "TRI_NODE_ADDRESS", default_value = "unknown")]
     address: String,
     #[arg(long, env = "TRI_NODE_CPUS", default_value_t = 1)]
@@ -29,6 +36,56 @@ struct Args {
     scratch: String,
 }
 
+static TASK_USER: OnceLock<Option<String>> = OnceLock::new();
+
+fn task_user() -> Option<&'static str> {
+    TASK_USER.get().and_then(|user| user.as_deref())
+}
+
+fn systemctl_command() -> Command {
+    let mut command = Command::new("systemctl");
+    if task_user().is_none() {
+        command.arg("--user");
+    }
+    command
+}
+
+fn create_directory(path: &std::path::Path) -> Result<()> {
+    if let Some(user) = task_user() {
+        let status = std::process::Command::new("runuser")
+            .args(["-u", user, "--", "mkdir", "-p", "--"])
+            .arg(path)
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "task account cannot create {}",
+            path.display()
+        );
+    } else {
+        std::fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
+
+fn remove_scratch(path: &std::path::Path) -> Result<()> {
+    if let Some(user) = task_user() {
+        let status = std::process::Command::new("runuser")
+            .args(["-u", user, "--", "rm", "-rf", "--"])
+            .arg(path)
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "task account cannot remove {}",
+            path.display()
+        );
+    } else if let Err(error) = std::fs::remove_dir_all(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 struct LocalTask {
     task_id: TaskId,
     unit: String,
@@ -40,6 +97,7 @@ struct LocalTask {
     timeout_seconds: Option<u64>,
     scratch: std::path::PathBuf,
     completion: Option<TaskCompletion>,
+    enforcement_failure: Option<String>,
 }
 
 struct TaskCompletion {
@@ -50,9 +108,40 @@ struct TaskCompletion {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).is_some_and(|arg| arg == "__run-task") {
+        anyhow::ensure!(
+            raw.len() >= 5 && raw[3] == "--",
+            "invalid internal task invocation"
+        );
+        tri::resources::exec_guarded(&raw[2], &raw[4..]);
+    }
     init_logging();
     let args = Args::parse();
-    std::fs::create_dir_all(&args.scratch)?;
+    if let Some(user) = &args.task_user {
+        anyhow::ensure!(
+            unsafe { libc::geteuid() } == 0,
+            "--task-user requires a root-owned system service"
+        );
+        let output = std::process::Command::new("id")
+            .args(["-u", "--", user])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() != "0",
+            "--task-user must name an existing non-root account"
+        );
+    } else {
+        anyhow::ensure!(
+            unsafe { libc::geteuid() } != 0,
+            "root clients must set --task-user to a non-root account"
+        );
+    }
+    TASK_USER
+        .set(args.task_user.clone())
+        .expect("execution mode already initialized");
+    if !args.check {
+        create_directory(std::path::Path::new(&args.scratch))?;
+    }
     let gpu_devices = if args.gpu_devices.is_empty() {
         (0..args.gpus)
             .map(|index| format!("/dev/nvidia{index}"))
@@ -64,8 +153,14 @@ async fn main() -> Result<()> {
         gpu_devices.len() >= args.gpus as usize,
         "TRI_NODE_GPU_DEVICES must list at least TRI_NODE_GPUS device paths"
     );
+    if args.check {
+        check_resource_enforcement(&gpu_devices)?;
+        println!("CPU, memory, swap, and unallocated GPU access checks passed");
+        return Ok(());
+    }
+    let node_name = args.name.context("node name is required")?;
     let registration = NodeRegistration {
-        name: args.name.clone(),
+        name: node_name.clone(),
         address: args.address.clone(),
         cpu_total: args.cpus,
         memory_bytes: args.memory,
@@ -89,7 +184,7 @@ async fn main() -> Result<()> {
     }
 
     let mut running: HashMap<TaskId, LocalTask> = HashMap::new();
-    if let Err(error) = reconcile_units(&args.name, &args.scratch, &mut running).await {
+    if let Err(error) = reconcile_units(&node_name, &args.scratch, &mut running).await {
         tracing::warn!(%error, "initial task reconciliation failed");
     }
     let mut next_heartbeat = Instant::now();
@@ -97,7 +192,22 @@ async fn main() -> Result<()> {
     loop {
         for local in running.values_mut() {
             if local.completion.is_none() {
-                local.completion = poll_task(&local.unit, local.timeout_seconds).await?;
+                if let Some(reason) = &local.enforcement_failure {
+                    match stop_task_unit(&local.unit).await {
+                        Ok(()) => {
+                            local.completion = Some(TaskCompletion {
+                                state: TaskState::Fail,
+                                exit_code: None,
+                                error: Some(reason.clone()),
+                            })
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, unit = %local.unit, "unsafe task stop not confirmed; retrying")
+                        }
+                    }
+                } else {
+                    local.completion = poll_task(&local.unit, local.timeout_seconds).await?;
+                }
             }
         }
         let mut acknowledged = Vec::new();
@@ -128,9 +238,7 @@ async fn main() -> Result<()> {
         }
         for id in acknowledged {
             if let Some(local) = running.remove(&id) {
-                if let Err(error) = std::fs::remove_dir_all(&local.scratch)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
+                if let Err(error) = remove_scratch(&local.scratch) {
                     tracing::warn!(task = id, %error, "failed to remove task scratch directory");
                 }
                 cleanup_task_unit(&local.unit).await;
@@ -147,7 +255,7 @@ async fn main() -> Result<()> {
                 Ok(Response::Ok) => {
                     next_registration = Instant::now() + Duration::from_secs(10);
                     if let Err(error) =
-                        reconcile_units(&args.name, &args.scratch, &mut running).await
+                        reconcile_units(&node_name, &args.scratch, &mut running).await
                     {
                         tracing::warn!(%error, "task reconciliation failed");
                     }
@@ -166,7 +274,7 @@ async fn main() -> Result<()> {
         if now >= next_heartbeat {
             let response = client::tcp(&Request::Heartbeat {
                 heartbeat: NodeHeartbeat {
-                    name: args.name.clone(),
+                    name: node_name.clone(),
                     cpu_used: running.values().map(|task| task.cpu_count).sum(),
                     memory_used: running.values().map(|task| task.memory_bytes).sum(),
                     gpu_used: running.values().map(|task| task.gpu_count).sum(),
@@ -211,7 +319,7 @@ async fn main() -> Result<()> {
 
         if running.len() < args.cpus as usize
             && let Ok(Response::Assignment(Some(assignment))) = client::tcp(&Request::Poll {
-                node: args.name.clone(),
+                node: node_name.clone(),
             })
             .await
         {
@@ -231,7 +339,7 @@ async fn main() -> Result<()> {
                 Err(error) => {
                     let scratch =
                         std::path::Path::new(&args.scratch).join(assignment.task.id.to_string());
-                    let _ = std::fs::remove_dir_all(scratch);
+                    let _ = remove_scratch(&scratch);
                     let _ = client::tcp(&Request::Complete {
                         result: TaskResult {
                             id: assignment.task.id,
@@ -252,7 +360,13 @@ async fn main() -> Result<()> {
 
 fn node_capabilities(gpu_devices: &[String]) -> Vec<String> {
     let mut capabilities = Vec::new();
-    let cgroup_controllers = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").ok();
+    let cgroup_controllers = (if task_user().is_some() {
+        Ok(std::path::PathBuf::from("/sys/fs/cgroup"))
+    } else {
+        tri::resources::user_manager_cgroup()
+    })
+    .and_then(|path| Ok(std::fs::read_to_string(path.join("cgroup.controllers"))?))
+    .ok();
     if cgroup_controllers.is_some() {
         capabilities.push("cgroup_v2".to_owned());
     }
@@ -266,12 +380,31 @@ fn node_capabilities(gpu_devices: &[String]) -> Vec<String> {
             }
         }
     }
-    if std::process::Command::new("systemctl")
-        .args(["--user", "show-environment"])
+    let mut manager = std::process::Command::new("systemctl");
+    if task_user().is_none() {
+        manager.arg("--user");
+    }
+    if manager
+        .args(["show-environment"])
         .output()
         .is_ok_and(|output| output.status.success())
     {
-        capabilities.push("systemd_user".to_owned());
+        capabilities.push(
+            if task_user().is_some() {
+                "systemd_system"
+            } else {
+                "systemd_user"
+            }
+            .to_owned(),
+        );
+    }
+    if capabilities.iter().any(|item| item == "cgroup:cpuset")
+        && capabilities.iter().any(|item| item == "cgroup:memory")
+    {
+        match check_resource_enforcement(gpu_devices) {
+            Ok(()) => capabilities.push("resource_enforcement".to_owned()),
+            Err(error) => tracing::warn!(%error, "resource enforcement probe failed"),
+        }
     }
     for device in gpu_devices {
         if std::path::Path::new(device).exists() {
@@ -279,6 +412,96 @@ fn node_capabilities(gpu_devices: &[String]) -> Vec<String> {
         }
     }
     capabilities
+}
+
+/// No tri-task prefix: this diagnostic must not be reconciled as queue work.
+fn check_resource_enforcement(gpu_devices: &[String]) -> Result<()> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let cpus = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .context("cannot read current CPU affinity")?;
+    let cpu = tri::resources::parse_set(cpus.trim())?
+        .into_iter()
+        .next()
+        .context("no usable CPU")?;
+    let limits = tri::resources::Limits {
+        cpus: cpu.to_string(),
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_devices: gpu_devices.to_vec(),
+        assigned_gpus: String::new(),
+        environment: vec![],
+        stdout_path: None,
+        stderr_path: None,
+    };
+    let unit = format!(
+        "tri-resource-check-{}-{}",
+        std::process::id(),
+        tri::now_seconds()
+    );
+    let mut probe = std::process::Command::new("systemd-run");
+    if let Some(user) = task_user() {
+        probe.args(["--property", &format!("User={user}")]);
+    } else {
+        probe.arg("--user");
+    }
+    let output = probe
+        .args([
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--unit",
+            &unit,
+            "--property",
+            &format!("AllowedCPUs={cpu}"),
+            "--property",
+            "MemoryMax=64M",
+            "--property",
+            "MemorySwapMax=0",
+            "--property",
+            "RuntimeMaxSec=15",
+            "--property",
+            "DevicePolicy=closed",
+            "--property",
+            "StandardOutput=journal",
+            "--property",
+            "StandardError=journal",
+        ])
+        .arg(std::env::current_exe()?)
+        .arg("__run-task")
+        .arg(serde_json::to_string(&limits)?)
+        .arg("--")
+        .arg("/usr/bin/true")
+        .output()
+        .context("starting resource enforcement diagnostic")?;
+    // Passing pipe descriptors from a service into PID 1 can be rejected by
+    // SELinux. Use journal output, as normal task units do, and retrieve it on
+    // failure so the guard's diagnostic is still visible to --check callers.
+    let journal = if !output.status.success() {
+        std::process::Command::new("journalctl")
+            .args([
+                "-u",
+                &format!("{unit}.service"),
+                "-n",
+                "30",
+                "--no-pager",
+                "-o",
+                "cat",
+            ])
+            .output()
+            .map(|result| String::from_utf8_lossy(&result.stdout).into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    anyhow::ensure!(
+        output.status.success(),
+        "resource enforcement probe failed ({}, unit {unit}.service): {}\n{}\nSee: journalctl -u {unit}.service -n 30 --no-pager",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim(),
+        journal.trim()
+    );
+    Ok(())
 }
 
 async fn spawn_task(
@@ -303,14 +526,14 @@ async fn spawn_task(
         return Ok(None);
     }
     let scratch = std::path::Path::new(scratch_root).join(task.id.to_string());
-    std::fs::create_dir_all(&scratch)?;
+    create_directory(&scratch)?;
     if let Some(parent) = std::path::Path::new(&task.stdout_path).parent() {
-        std::fs::create_dir_all(parent)?;
+        create_directory(parent)?;
     }
     if task.stderr_path != task.stdout_path
         && let Some(parent) = std::path::Path::new(&task.stderr_path).parent()
     {
-        std::fs::create_dir_all(parent)?;
+        create_directory(parent)?;
     }
     let workdir = if task.spec.scratch_cwd {
         scratch.clone()
@@ -321,8 +544,12 @@ async fn spawn_task(
     };
     let unit = format!("tri-task-{}-{}", task.id, task.attempt);
     let mut command = Command::new("systemd-run");
+    if let Some(user) = task_user() {
+        command.args(["--property", &format!("User={user}")]);
+    } else {
+        command.arg("--user");
+    }
     command.args([
-        "--user",
         "--quiet",
         "--no-block",
         "--remain-after-exit",
@@ -334,13 +561,23 @@ async fn spawn_task(
     command.arg(&workdir);
     command.args([
         "--property",
-        &format!("StandardOutput=append:{}", task.stdout_path),
+        &if task_user().is_some() {
+            "StandardOutput=journal".to_owned()
+        } else {
+            format!("StandardOutput=append:{}", task.stdout_path)
+        },
         "--property",
-        &format!("StandardError=append:{}", task.stderr_path),
+        &if task_user().is_some() {
+            "StandardError=journal".to_owned()
+        } else {
+            format!("StandardError=append:{}", task.stderr_path)
+        },
         "--property",
         "OOMPolicy=stop",
         "--property",
         "KillMode=control-group",
+        "--property",
+        "NoNewPrivileges=yes",
     ]);
     if task.spec.requested_mem_bytes > 0 {
         command.args([
@@ -367,15 +604,13 @@ async fn spawn_task(
         "--setenv",
         &format!("TMPDIR={}", scratch.display()),
     ]);
-    for (key, value) in &task.spec.env {
-        command.args(["--setenv", &format!("{key}={value}")]);
+    // Apply the device allowlist even to CPU-only jobs.
+    command.args(["--property", "DevicePolicy=closed"]);
+    for device in standard_device_paths() {
+        command.args(["--property", &format!("DeviceAllow={device} rwm")]);
     }
     if !gpus.is_empty() {
-        command.args(["--property", "DevicePolicy=closed"]);
-        for device in standard_device_paths() {
-            command.args(["--property", &format!("DeviceAllow={device} rwm")]);
-        }
-        for device in gpu_support_device_paths() {
+        for device in tri::resources::gpu_support_devices() {
             command.args(["--property", &format!("DeviceAllow={device} rwm")]);
         }
         for index in parse_resource_set(gpus) {
@@ -384,15 +619,31 @@ async fn spawn_task(
                 .with_context(|| format!("no device path configured for GPU {index}"))?;
             command.args(["--property", &format!("DeviceAllow={device} rwm")]);
         }
-        command.args([
-            "--setenv",
-            &format!("CUDA_VISIBLE_DEVICES={gpus}"),
-            "--setenv",
-            &format!("NVIDIA_VISIBLE_DEVICES={gpus}"),
-        ]);
     }
-    command.arg(&task.spec.command[0]);
-    command.args(&task.spec.command[1..]);
+    let limits = tri::resources::Limits {
+        cpus: cpus.to_owned(),
+        memory_bytes: task.spec.requested_mem_bytes,
+        gpu_devices: gpu_devices.to_vec(),
+        assigned_gpus: gpus.to_owned(),
+        environment: task.spec.env.clone(),
+        stdout_path: task_user().map(|_| task.stdout_path.clone()),
+        stderr_path: task_user().map(|_| task.stderr_path.clone()),
+    };
+    anyhow::ensure!(
+        tri::resources::parse_set(cpus)?.len() == task.spec.requested_cpu as usize,
+        "CPU assignment does not match reservation"
+    );
+    anyhow::ensure!(
+        tri::resources::parse_set(gpus)?.len() == task.spec.requested_gpus as usize,
+        "GPU assignment does not match reservation"
+    );
+    // Reuse this executable so installation does not require another helper.
+    command.arg(std::env::current_exe()?);
+    command
+        .arg("__run-task")
+        .arg(serde_json::to_string(&limits)?)
+        .arg("--");
+    command.args(&task.spec.command);
     let status = command
         .status()
         .await
@@ -414,6 +665,7 @@ async fn spawn_task(
         timeout_seconds: task.spec.timeout_seconds,
         scratch,
         completion: None,
+        enforcement_failure: None,
     }))
 }
 
@@ -446,15 +698,72 @@ async fn reconcile_units(
             continue;
         }
         let unit = format!("tri-task-{}-{}", task.id, task.attempt);
-        running.insert(task.id, local_task_from_task(&task, unit, scratch_root)?);
+        let mut local = local_task_from_task(&task, unit.clone(), scratch_root)?;
+        local.completion = poll_task(&unit, task.spec.timeout_seconds).await?;
+        if local.completion.is_none()
+            && let Err(error) = verify_adopted_unit(&unit, &task).await
+        {
+            local.enforcement_failure = Some(format!(
+                "resource enforcement failed during reconciliation: {error:#}"
+            ));
+        }
+        running.insert(task.id, local);
     }
     Ok(())
 }
 
-async fn list_task_units() -> Result<(Vec<ObservedUnit>, Vec<String>)> {
-    let output = Command::new("systemctl")
+async fn verify_adopted_unit(unit: &str, task: &tri::model::Task) -> Result<()> {
+    let output = systemctl_command()
         .args([
-            "--user",
+            "show",
+            &format!("{unit}.service"),
+            "-p",
+            "ControlGroup",
+            "-p",
+            "ExecStart",
+        ])
+        .output()
+        .await?;
+    anyhow::ensure!(output.status.success(), "cannot inspect adopted task");
+    let text = String::from_utf8(output.stdout)?;
+    let fields: HashMap<_, _> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let executable = std::env::current_exe()?;
+    let prefix = format!("argv[]={}", executable.display());
+    anyhow::ensure!(
+        fields
+            .get("ExecStart")
+            .is_some_and(|value| value.contains(&format!("{prefix} __run-task "))),
+        "legacy task has no resource verification guard; drain tasks before upgrading"
+    );
+    let path = tri::resources::cgroup_path(
+        std::path::Path::new("/sys/fs/cgroup"),
+        fields
+            .get("ControlGroup")
+            .context("task cgroup is missing")?,
+    )?;
+    tri::resources::verify_cgroup(
+        &path,
+        &tri::resources::Limits {
+            cpus: task
+                .assigned_cpus
+                .clone()
+                .context("task has no CPU assignment")?,
+            memory_bytes: task.spec.requested_mem_bytes,
+            gpu_devices: vec![],
+            assigned_gpus: task.assigned_gpus.clone().unwrap_or_default(),
+            environment: vec![],
+            stdout_path: None,
+            stderr_path: None,
+        },
+    )
+}
+
+async fn list_task_units() -> Result<(Vec<ObservedUnit>, Vec<String>)> {
+    let output = systemctl_command()
+        .args([
             "list-units",
             "--all",
             "--plain",
@@ -501,7 +810,7 @@ fn local_task_from_task(
     scratch_root: &str,
 ) -> Result<LocalTask> {
     let scratch = std::path::Path::new(scratch_root).join(task.id.to_string());
-    std::fs::create_dir_all(&scratch)?;
+    create_directory(&scratch)?;
     Ok(LocalTask {
         task_id: task.id,
         unit,
@@ -513,6 +822,7 @@ fn local_task_from_task(
         timeout_seconds: task.spec.timeout_seconds,
         scratch,
         completion: None,
+        enforcement_failure: None,
     })
 }
 
@@ -540,30 +850,10 @@ fn standard_device_paths() -> [&'static str; 5] {
     ]
 }
 
-fn gpu_support_device_paths() -> Vec<&'static str> {
-    [
-        "/dev/nvidiactl",
-        "/dev/nvidia-uvm",
-        "/dev/nvidia-uvm-tools",
-        "/dev/nvidia-modeset",
-        "/dev/nvidia-caps/*",
-    ]
-    .into_iter()
-    .filter(|path| {
-        if path.ends_with("/*") {
-            std::path::Path::new(path.trim_end_matches("/*")).exists()
-        } else {
-            std::path::Path::new(path).exists()
-        }
-    })
-    .collect()
-}
-
 async fn poll_task(unit: &str, timeout_seconds: Option<u64>) -> Result<Option<TaskCompletion>> {
     let unit = format!("{unit}.service");
-    let output = Command::new("systemctl")
+    let output = systemctl_command()
         .args([
-            "--user",
             "show",
             &unit,
             "-p",
@@ -605,6 +895,13 @@ async fn poll_task(unit: &str, timeout_seconds: Option<u64>) -> Result<Option<Ta
     let status = fields
         .get("ExecMainStatus")
         .and_then(|value| value.parse::<i32>().ok());
+    if status == Some(tri::resources::ENFORCEMENT_EXIT_CODE) && result == "exit-code" {
+        return Ok(Some(TaskCompletion {
+            state: TaskState::Fail,
+            exit_code: status,
+            error: Some("resource enforcement verification failed; see task stderr".into()),
+        }));
+    }
     if result == "oom-kill" {
         return Ok(Some(TaskCompletion {
             state: TaskState::Fail,
@@ -641,9 +938,14 @@ async fn poll_task(unit: &str, timeout_seconds: Option<u64>) -> Result<Option<Ta
 }
 
 async fn stop_task_unit(unit: &str) -> Result<()> {
+    anyhow::ensure!(
+        unit.starts_with("tri-task-")
+            && unit.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "refusing to stop a non-task unit"
+    );
     let unit = format!("{unit}.service");
-    let status = Command::new("systemctl")
-        .args(["--user", "stop", &unit])
+    let status = systemctl_command()
+        .args(["stop", &unit])
         .status()
         .await
         .with_context(|| format!("stopping task service {unit}"))?;
@@ -656,8 +958,8 @@ async fn stop_task_unit(unit: &str) -> Result<()> {
 
 async fn cleanup_task_unit(unit: &str) {
     let _ = stop_task_unit(unit).await;
-    let _ = Command::new("systemctl")
-        .args(["--user", "reset-failed", &format!("{unit}.service")])
+    let _ = systemctl_command()
+        .args(["reset-failed", &format!("{unit}.service")])
         .status()
         .await;
 }

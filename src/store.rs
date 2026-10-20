@@ -101,8 +101,15 @@ impl Store {
     pub fn submit_with_receipt(
         &self,
         request_id: Option<&str>,
-        spec: TaskSpec,
+        mut spec: TaskSpec,
     ) -> Result<(Task, bool)> {
+        anyhow::ensure!(
+            spec.requested_cpu > 0,
+            "requested_cpu must be greater than zero"
+        );
+        if spec.requested_mem_bytes == 0 {
+            spec.requested_mem_bytes = crate::resources::DEFAULT_MEMORY_BYTES;
+        }
         anyhow::ensure!(
             spec.max_attempts > 0,
             "max_attempts must be greater than zero"
@@ -1000,6 +1007,10 @@ mod tests {
             .submit_with_receipt(Some("request-1"), spec.clone())
             .unwrap();
         assert!(created);
+        assert_eq!(
+            first.spec.requested_mem_bytes,
+            crate::resources::DEFAULT_MEMORY_BYTES
+        );
         let (retry, created) = store
             .submit_with_receipt(Some("request-1"), spec.clone())
             .unwrap();

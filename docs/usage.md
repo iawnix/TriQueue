@@ -18,8 +18,8 @@ tri_stat "$job_id"
 tri_log "$job_id" --follow
 ```
 
-Commands default to one CPU, no GPUs, and no task-specific memory limit.
-Use `--mem` to reserve memory and enforce a limit. Sizes such as `512M` and `8G`
+Commands default to one CPU, no GPUs, and a 1 GiB memory reservation and limit.
+Use `--mem` to choose a different positive memory limit; zero uses the default. Sizes such as `512M` and `8G`
 use powers of 1024. A task waits until its requested resources are available.
 `--node worker-1` restricts it to a named node; otherwise the scheduler chooses.
 
@@ -107,7 +107,9 @@ tri_sub --cpu 4 --mem 8G --gpu 1 -- python3 train.py
 
 The scheduler assigns GPU indexes. The client configures systemd device rules
 and sets `CUDA_VISIBLE_DEVICES` and `NVIDIA_VISIBLE_DEVICES` for the task.
-A GPU count reserves devices; it does not set a GPU memory quota. See
+A GPU count reserves devices; it does not set a GPU memory quota.
+Tasks without GPU reservations are denied GPU device access. The command only
+starts after checking that unallocated devices cannot be opened. See
 [deployment](deployment.md#compute-node-configuration) for node device configuration.
 
 ## Scratch directories
