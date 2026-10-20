@@ -1,4 +1,4 @@
-use crate::model::{NodeHeartbeat, NodeInfo, NodeRegistration, TaskId, TaskState};
+use crate::model::{NodeHeartbeat, NodeInfo, NodeRegistration, Task, TaskId, TaskState};
 use crate::protocol::{PROTOCOL_VERSION, Request, Response, capabilities};
 use crate::store::{DependencyStatus, LEASE_SECONDS, Store};
 use crate::{socket_path, tcp_addr};
@@ -123,7 +123,21 @@ impl Server {
             }
             Request::Nodes => {
                 let nodes = self.nodes.lock().expect("nodes mutex poisoned");
-                Ok(Response::Nodes(nodes.values().cloned().collect()))
+                let tasks = self.store.list(None)?;
+                Ok(Response::Nodes(
+                    nodes
+                        .values()
+                        .cloned()
+                        .map(|mut node| {
+                            let allocation = NodeAllocation::from_tasks(&tasks, &node.name);
+                            node.cpu_used = allocation.cpus.len() as u32;
+                            node.gpu_used = allocation.gpus.len() as u32;
+                            node.memory_used = allocation.memory;
+                            node.running_tasks = allocation.tasks;
+                            node
+                        })
+                        .collect(),
+                ))
             }
             Request::Clean { older_than_seconds } => Ok(Response::Cleaned {
                 removed: self.store.clean(older_than_seconds)?,
@@ -186,10 +200,6 @@ impl Server {
         if let Some(node) = nodes.get_mut(&heartbeat.name) {
             node.online = true;
             node.last_seen = crate::now_string();
-            node.cpu_used = heartbeat.cpu_used;
-            node.memory_used = heartbeat.memory_used;
-            node.gpu_used = heartbeat.gpu_used;
-            node.running_tasks = heartbeat.running_tasks.iter().map(|task| task.id).collect();
         }
         let mut cancelled = Vec::new();
         for running in &heartbeat.running_tasks {
@@ -239,18 +249,10 @@ impl Server {
             return Ok(None);
         }
         let tasks = self.store.list(Some("wait"))?;
-        let running = self.store.list(None)?;
-        let mut occupied_cpus = std::collections::BTreeSet::new();
-        let mut occupied_gpus = std::collections::BTreeSet::new();
-        let mut occupied_memory = 0u64;
-        for running_task in running.iter().filter(|task| {
-            task.node.as_deref() == Some(node_name)
-                && matches!(task.state, TaskState::Run | TaskState::Cancel)
-        }) {
-            occupied_cpus.extend(parse_resource_set(running_task.assigned_cpus.as_deref()));
-            occupied_gpus.extend(parse_resource_set(running_task.assigned_gpus.as_deref()));
-            occupied_memory = occupied_memory.saturating_add(running_task.spec.requested_mem_bytes);
-        }
+        let allocation = NodeAllocation::from_tasks(&self.store.list(None)?, node_name);
+        let occupied_cpus = &allocation.cpus;
+        let occupied_gpus = &allocation.gpus;
+        let occupied_memory = allocation.memory;
         for task in tasks {
             if task
                 .spec
@@ -278,22 +280,16 @@ impl Server {
                 continue;
             }
             let Some(cpus) =
-                first_free_range(node.cpu_total, task.spec.requested_cpu, &occupied_cpus)
+                first_free_range(node.cpu_total, task.spec.requested_cpu, occupied_cpus)
             else {
                 continue;
             };
             let Some(gpus) =
-                first_free_range(node.gpu_total, task.spec.requested_gpus, &occupied_gpus)
+                first_free_range(node.gpu_total, task.spec.requested_gpus, occupied_gpus)
             else {
                 continue;
             };
             if let Some(task) = self.store.claim(task.id, node_name, &cpus, &gpus)? {
-                occupied_cpus.extend(parse_resource_set(Some(&cpus)));
-                occupied_gpus.extend(parse_resource_set(Some(&gpus)));
-                node.cpu_used += task.spec.requested_cpu;
-                node.memory_used += task.spec.requested_mem_bytes;
-                node.gpu_used += task.spec.requested_gpus;
-                node.running_tasks.push(task.id);
                 return Ok(Some(crate::model::TaskAssignment { task, cpus, gpus }));
             }
         }
@@ -301,38 +297,12 @@ impl Server {
     }
 
     fn complete(&self, result: &crate::model::TaskResult) -> Result<()> {
-        let task = self.store.get(result.id)?;
         self.store.complete(result)?;
-        if let Some(task) = task
-            && let Some(node_name) = task.node.as_deref()
-            && matches!(task.state, TaskState::Run | TaskState::Cancel)
-            && task.lease_id == result.lease_id
-            && task.attempt == result.attempt
-        {
-            self.release_node_resources(node_name, &task);
-        }
         Ok(())
     }
 
-    fn release_node_resources(&self, node_name: &str, task: &crate::model::Task) {
-        let mut nodes = self.nodes.lock().expect("nodes mutex poisoned");
-        if let Some(node) = nodes.get_mut(node_name) {
-            node.cpu_used = node.cpu_used.saturating_sub(task.spec.requested_cpu);
-            node.memory_used = node
-                .memory_used
-                .saturating_sub(task.spec.requested_mem_bytes);
-            node.gpu_used = node.gpu_used.saturating_sub(task.spec.requested_gpus);
-            node.running_tasks.retain(|id| *id != task.id);
-        }
-    }
-
     fn reap_expired(&self) -> Result<()> {
-        let expired = self.store.reap_expired(crate::now_seconds())?;
-        for task in expired {
-            if let Some(node_name) = task.node.as_deref() {
-                self.release_node_resources(node_name, &task);
-            }
-        }
+        self.store.reap_expired(crate::now_seconds())?;
         let now = crate::now_seconds();
         let mut nodes = self.nodes.lock().expect("nodes mutex poisoned");
         for node in nodes.values_mut() {
@@ -340,6 +310,35 @@ impl Server {
             node.online = now.saturating_sub(last_seen) <= LEASE_SECONDS;
         }
         Ok(())
+    }
+}
+
+/// One reservation snapshot powers both admission and node display.
+#[derive(Default)]
+struct NodeAllocation {
+    cpus: std::collections::BTreeSet<u32>,
+    gpus: std::collections::BTreeSet<u32>,
+    memory: u64,
+    tasks: Vec<TaskId>,
+}
+
+impl NodeAllocation {
+    fn from_tasks(tasks: &[Task], node_name: &str) -> Self {
+        let mut result = Self::default();
+        for task in tasks
+            .iter()
+            .filter(|task| task.node.as_deref() == Some(node_name) && task.reserves_resources())
+        {
+            result
+                .cpus
+                .extend(parse_resource_set(task.assigned_cpus.as_deref()));
+            result
+                .gpus
+                .extend(parse_resource_set(task.assigned_gpus.as_deref()));
+            result.memory = result.memory.saturating_add(task.spec.requested_mem_bytes);
+            result.tasks.push(task.id);
+        }
+        result
     }
 }
 
@@ -485,6 +484,255 @@ mod tests {
         };
         assert_eq!(third.cpus, "0-1");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn test_server(name: &str) -> (Server, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("tri-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let server = Server::new(Store::open(&root.join("tri.db"), &root.join("data")).unwrap());
+        server
+            .handle(Request::Register {
+                node: NodeRegistration {
+                    name: "fed1".into(),
+                    address: "local".into(),
+                    cpu_total: 24,
+                    memory_bytes: 31 << 30,
+                    gpu_total: 2,
+                    scratch: root.to_string_lossy().into(),
+                    gpu_devices: vec![],
+                    capabilities: vec![],
+                },
+            })
+            .unwrap();
+        (server, root)
+    }
+
+    fn submit_resources(server: &Server, name: &str, cpu: u32, memory: u64, gpus: u32) -> Task {
+        let mut spec = spec(name, cpu);
+        spec.requested_mem_bytes = memory;
+        spec.requested_gpus = gpus;
+        match server
+            .handle(Request::Submit {
+                request_id: None,
+                spec,
+            })
+            .unwrap()
+        {
+            Response::Submitted { task, .. } => task,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn poll_assignment(server: &Server) -> Option<crate::model::TaskAssignment> {
+        match server
+            .handle(Request::Poll {
+                node: "fed1".into(),
+            })
+            .unwrap()
+        {
+            Response::Assignment(task) => task,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn node_view(server: &Server) -> NodeInfo {
+        match server.handle(Request::Nodes).unwrap() {
+            Response::Nodes(mut nodes) => nodes.remove(0),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_confirmation_releases_cpu_memory_and_gpu_on_next_poll() {
+        let (server, root) = test_server("cancel-release");
+        let first = submit_resources(&server, "cancel", 12, 13 << 30, 1);
+        let claimed = poll_assignment(&server).unwrap();
+        server.handle(Request::Cancel { id: first.id }).unwrap();
+        // Even an empty heartbeat must not erase an unacknowledged reservation.
+        server
+            .handle(Request::Heartbeat {
+                heartbeat: NodeHeartbeat {
+                    name: "fed1".into(),
+                    cpu_used: 0,
+                    memory_used: 0,
+                    gpu_used: 0,
+                    running_tasks: vec![],
+                },
+            })
+            .unwrap();
+        let node = node_view(&server);
+        assert_eq!(
+            (node.cpu_used, node.memory_used, node.gpu_used),
+            (12, 13 << 30, 1)
+        );
+        assert_eq!(node.running_tasks, vec![first.id]);
+        submit_resources(&server, "next-a", 12, 13 << 30, 1);
+        submit_resources(&server, "next-b", 12, 13 << 30, 1);
+        let second = poll_assignment(&server).unwrap();
+        assert_eq!(second.cpus, "12-23");
+        assert!(poll_assignment(&server).is_none());
+        let mut result = TaskResult {
+            id: first.id,
+            state: TaskState::Cancel,
+            exit_code: None,
+            error: Some("cancel confirmed by node".into()),
+            attempt: claimed.task.attempt,
+            lease_id: Some("stale-lease".into()),
+        };
+        server
+            .handle(Request::Complete {
+                result: result.clone(),
+            })
+            .unwrap();
+        assert!(poll_assignment(&server).is_none());
+        result.lease_id = claimed.task.lease_id;
+        server
+            .handle(Request::Complete {
+                result: result.clone(),
+            })
+            .unwrap();
+        let node = node_view(&server);
+        assert_eq!(
+            (node.cpu_used, node.memory_used, node.gpu_used),
+            (12, 13 << 30, 1)
+        );
+        assert_eq!(node.running_tasks, vec![second.task.id]);
+        let third = poll_assignment(&server).unwrap();
+        assert_eq!(third.cpus, "0-11");
+        assert_eq!(third.gpus, "0-0");
+        // Duplicate completion and stale telemetry cannot subtract a new allocation.
+        server.handle(Request::Complete { result }).unwrap();
+        server
+            .handle(Request::Heartbeat {
+                heartbeat: NodeHeartbeat {
+                    name: "fed1".into(),
+                    cpu_used: 0,
+                    memory_used: 0,
+                    gpu_used: 0,
+                    running_tasks: vec![],
+                },
+            })
+            .unwrap();
+        let node = node_view(&server);
+        assert_eq!(
+            (node.cpu_used, node.memory_used, node.gpu_used),
+            (24, 26 << 30, 2)
+        );
+        assert_eq!(node.running_tasks, vec![second.task.id, third.task.id]);
+        let finished = server.store.get(first.id).unwrap().unwrap();
+        assert!(finished.cancel_confirmed);
+        assert_eq!(
+            finished.completion_reason.as_deref(),
+            Some("node_completion")
+        );
+        assert!(!finished.reserves_resources());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn each_resource_blocks_admission_until_cancel_is_confirmed() {
+        // Independently make CPU, memory, and GPU the limiting resource.
+        for (index, (cpu, memory, gpu)) in [(24, 0, 0), (1, 31 << 30, 0), (1, 0, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            let (server, root) = test_server(&format!("cancel-limits-{index}"));
+            let first = submit_resources(&server, "cancel", cpu, memory, gpu);
+            let claimed = poll_assignment(&server).unwrap();
+            server.handle(Request::Cancel { id: first.id }).unwrap();
+            submit_resources(&server, "next", cpu, memory, gpu);
+            assert!(poll_assignment(&server).is_none());
+            server
+                .handle(Request::Complete {
+                    result: TaskResult {
+                        id: first.id,
+                        state: TaskState::Cancel,
+                        exit_code: None,
+                        error: None,
+                        attempt: claimed.task.attempt,
+                        lease_id: claimed.task.lease_id,
+                    },
+                })
+                .unwrap();
+            assert!(poll_assignment(&server).is_some());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn queued_cancel_and_all_execution_terminal_states_release_capacity() {
+        let (server, root) = test_server("terminal-capacity");
+        let queued = submit_resources(&server, "queued", 24, 31 << 30, 2);
+        let Response::Task(cancelled) = server.handle(Request::Cancel { id: queued.id }).unwrap()
+        else {
+            panic!()
+        };
+        assert!(cancelled.cancel_confirmed);
+        assert_eq!(
+            cancelled.completion_reason.as_deref(),
+            Some("cancelled_before_start")
+        );
+        assert_eq!(node_view(&server).cpu_used, 0);
+        for state in [TaskState::Done, TaskState::Fail, TaskState::TimedOut] {
+            submit_resources(&server, state.as_str(), 24, 31 << 30, 2);
+            let claimed = poll_assignment(&server).unwrap();
+            assert_eq!(node_view(&server).cpu_used, 24);
+            let mut result = TaskResult {
+                id: claimed.task.id,
+                state: TaskState::Run,
+                exit_code: None,
+                error: None,
+                attempt: claimed.task.attempt,
+                lease_id: claimed.task.lease_id,
+            };
+            assert!(
+                server
+                    .handle(Request::Complete {
+                        result: result.clone()
+                    })
+                    .is_err()
+            );
+            assert_eq!(node_view(&server).cpu_used, 24);
+            result.state = state;
+            server.handle(Request::Complete { result }).unwrap();
+            let node = node_view(&server);
+            assert_eq!((node.cpu_used, node.memory_used, node.gpu_used), (0, 0, 0));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_cancel_does_not_reserve_resources_after_restart() {
+        let (server, root) = test_server("legacy-cancel");
+        let first = submit_resources(&server, "legacy", 24, 31 << 30, 2);
+        poll_assignment(&server).unwrap();
+        // Simulate the old schema and a closed cancellation without stop evidence.
+        drop(server);
+        let conn = rusqlite::Connection::open(root.join("tri.db")).unwrap();
+        conn.execute("UPDATE tasks SET state='cancel', finished_at='1', lease_id=NULL, lease_expires_at=NULL WHERE id=?1", [first.id]).unwrap();
+        conn.execute_batch("ALTER TABLE tasks DROP COLUMN cancel_confirmed; ALTER TABLE tasks DROP COLUMN completion_reason;").unwrap();
+        drop(conn);
+        let server = Server::new(Store::open(&root.join("tri.db"), &root.join("data")).unwrap());
+        server.register(NodeRegistration {
+            name: "fed1".into(),
+            address: "local".into(),
+            cpu_total: 24,
+            memory_bytes: 31 << 30,
+            gpu_total: 2,
+            scratch: root.to_string_lossy().into(),
+            gpu_devices: vec![],
+            capabilities: vec![],
+        });
+        let old = server.store.get(first.id).unwrap().unwrap();
+        assert!(!old.cancel_confirmed);
+        assert!(old.completion_reason.is_none());
+        assert_eq!(node_view(&server).cpu_used, 0);
+        submit_resources(&server, "new-a", 12, 13 << 30, 1);
+        submit_resources(&server, "new-b", 12, 13 << 30, 1);
+        assert_eq!(poll_assignment(&server).unwrap().cpus, "0-11");
+        assert_eq!(poll_assignment(&server).unwrap().cpus, "12-23");
+        assert_eq!(node_view(&server).cpu_used, 24);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

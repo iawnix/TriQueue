@@ -39,6 +39,7 @@ struct LocalTask {
     gpu_count: u32,
     timeout_seconds: Option<u64>,
     scratch: std::path::PathBuf,
+    completion: Option<TaskCompletion>,
 }
 
 struct TaskCompletion {
@@ -94,13 +95,38 @@ async fn main() -> Result<()> {
     let mut next_heartbeat = Instant::now();
     let mut next_registration = Instant::now() + Duration::from_secs(10);
     loop {
-        let mut completed = Vec::new();
-        for (id, local) in &running {
-            if let Some(result) = poll_task(&local.unit, local.timeout_seconds).await? {
-                completed.push((*id, result));
+        for local in running.values_mut() {
+            if local.completion.is_none() {
+                local.completion = poll_task(&local.unit, local.timeout_seconds).await?;
             }
         }
-        for (id, result) in completed {
+        let mut acknowledged = Vec::new();
+        for (id, local) in &running {
+            let Some(result) = &local.completion else {
+                continue;
+            };
+            let response = client::tcp(&Request::Complete {
+                result: TaskResult {
+                    id: *id,
+                    state: result.state.clone(),
+                    exit_code: result.exit_code,
+                    error: result.error.clone(),
+                    attempt: local.attempt,
+                    lease_id: local.lease_id.clone(),
+                },
+            })
+            .await;
+            if matches!(response, Ok(Response::Ok)) {
+                acknowledged.push(*id);
+            } else {
+                tracing::warn!(
+                    task = id,
+                    ?response,
+                    "completion not acknowledged; retrying"
+                );
+            }
+        }
+        for id in acknowledged {
             if let Some(local) = running.remove(&id) {
                 if let Err(error) = std::fs::remove_dir_all(&local.scratch)
                     && error.kind() != std::io::ErrorKind::NotFound
@@ -108,17 +134,6 @@ async fn main() -> Result<()> {
                     tracing::warn!(task = id, %error, "failed to remove task scratch directory");
                 }
                 cleanup_task_unit(&local.unit).await;
-                let _ = client::tcp(&Request::Complete {
-                    result: TaskResult {
-                        id,
-                        state: result.state,
-                        exit_code: result.exit_code,
-                        error: result.error,
-                        attempt: local.attempt,
-                        lease_id: local.lease_id,
-                    },
-                })
-                .await;
             }
         }
 
@@ -170,8 +185,24 @@ async fn main() -> Result<()> {
             .await;
             if let Ok(Response::Heartbeat { cancel }) = response {
                 for id in cancel {
-                    if let Some(unit) = running.get(&id).map(|task| task.unit.clone()) {
-                        let _ = stop_task_unit(&unit).await;
+                    if let Some(local) = running.get_mut(&id)
+                        && local.completion.is_none()
+                    {
+                        match stop_task_unit(&local.unit).await {
+                            Ok(()) => {
+                                // systemctl stop waits for the stop job, including
+                                // KillMode=control-group cleanup. The unit may be
+                                // unloaded immediately afterwards: retain the ack.
+                                local.completion = Some(TaskCompletion {
+                                    state: TaskState::Cancel,
+                                    exit_code: None,
+                                    error: Some("cancel confirmed by node".into()),
+                                });
+                            }
+                            Err(error) => {
+                                tracing::warn!(task = id, %error, "cancel not confirmed; retrying")
+                            }
+                        }
                     }
                 }
             }
@@ -308,6 +339,8 @@ async fn spawn_task(
         &format!("StandardError=append:{}", task.stderr_path),
         "--property",
         "OOMPolicy=stop",
+        "--property",
+        "KillMode=control-group",
     ]);
     if task.spec.requested_mem_bytes > 0 {
         command.args([
@@ -380,6 +413,7 @@ async fn spawn_task(
         gpu_count: task.spec.requested_gpus,
         timeout_seconds: task.spec.timeout_seconds,
         scratch,
+        completion: None,
     }))
 }
 
@@ -478,6 +512,7 @@ fn local_task_from_task(
         gpu_count: task.spec.requested_gpus,
         timeout_seconds: task.spec.timeout_seconds,
         scratch,
+        completion: None,
     })
 }
 
@@ -616,20 +651,15 @@ async fn stop_task_unit(unit: &str) -> Result<()> {
         status.success(),
         "systemctl could not stop task service {unit}"
     );
-    let status = Command::new("systemctl")
-        .args(["--user", "reset-failed", &unit])
-        .status()
-        .await
-        .with_context(|| format!("resetting task service {unit}"))?;
-    anyhow::ensure!(
-        status.success(),
-        "systemctl could not reset task service {unit}"
-    );
     Ok(())
 }
 
 async fn cleanup_task_unit(unit: &str) {
     let _ = stop_task_unit(unit).await;
+    let _ = Command::new("systemctl")
+        .args(["--user", "reset-failed", &format!("{unit}.service")])
+        .status()
+        .await;
 }
 
 #[cfg(test)]

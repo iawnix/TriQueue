@@ -22,6 +22,39 @@ tri_clean     remove old finished task records
 state, attempt, lease, exit code, and log paths. `tri_log` keeps stdout and
 stderr as raw task output.
 
+### Cancellation and resource reservations
+
+Cancelling a queued task finishes it immediately. Cancelling a running task
+keeps its CPU, memory and GPU reservation until the node reports completion.
+After the acknowledgement, the next poll can reuse those resources. Scheduling,
+`tri_node` and `tri_top` all derive reservations from the same unfinished
+attempts with a lease; historical `node` and `assigned_cpus`/`assigned_gpus`
+fields remain available for auditing and do not reserve capacity.
+
+The task state stays `cancel` for API compatibility. Inspect these fields to
+distinguish a request from a confirmed cancellation:
+
+| Situation | `cancel_confirmed` | `completion_reason` |
+| --- | --- | --- |
+| Cancel requested, node has not acknowledged | `false` | `null` |
+| Cancelled while queued | `true` | `cancelled_before_start` |
+| Node reported completion after cancellation | `true` | `node_completion` |
+| Cancelled attempt's lease expired | `false` | `lease_expired` |
+
+Lease expiry closes the scheduler's reservation under the existing lost-node
+policy; it does **not** prove the process stopped. Consumers must keep execution
+status unresolved in that case. A delayed completion for the same cancelled
+attempt can subsequently confirm stopping. Cancellation heartbeats renew the
+lease while the node is still stopping the task. Failed stop requests are
+retried; successful stop acknowledgements are retained in the client until the
+server acknowledges them, before unit cleanup.
+
+Existing databases migrate automatically. Historical cancellations without
+a recorded confirmation remain unconfirmed; migration does not manufacture
+stop evidence. Closed historical records no longer reduce available capacity.
+Deploy updated server, CLI and compute-client binaries together so that JSON
+consumers receive the new fields and clients retain stop acknowledgements.
+
 Use `--external-id` for a stable workflow task identity and `--request-id` (or
 its `--idempotency-key` alias) when a caller may retry a submission after a
 lost response. Repeating either identifier with the same task specification

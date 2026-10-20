@@ -13,6 +13,7 @@ pub fn capabilities() -> Vec<String> {
         "cgroup_limits",
         "node_capabilities",
         "retention_clean",
+        "cancel_confirmation",
     ]
     .into_iter()
     .map(str::to_owned)

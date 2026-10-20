@@ -43,7 +43,9 @@ impl Store {
                attempt INTEGER NOT NULL DEFAULT 0,
                lease_id TEXT,
                lease_expires_at TEXT,
-               external_id TEXT
+               external_id TEXT,
+               cancel_confirmed INTEGER NOT NULL DEFAULT 0,
+               completion_reason TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, id);
              CREATE TABLE IF NOT EXISTS submission_receipts (
@@ -65,6 +67,8 @@ impl Store {
             ("lease_id", "TEXT"),
             ("lease_expires_at", "TEXT"),
             ("external_id", "TEXT"),
+            ("cancel_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+            ("completion_reason", "TEXT"),
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name=?1",
@@ -276,7 +280,8 @@ impl Store {
         let lease_expires_at = (crate::now_seconds() + LEASE_SECONDS).to_string();
         let changed = conn.execute(
             "UPDATE tasks SET state='run', node=?1, assigned_cpus=?2, assigned_gpus=?3,
-                    started_at=?4, attempt=?5, lease_id=?6, lease_expires_at=?7
+                    started_at=?4, attempt=?5, lease_id=?6, lease_expires_at=?7,
+                    completion_reason=NULL, cancel_confirmed=0
              WHERE id=?8 AND state='wait'",
             params![
                 node,
@@ -298,7 +303,9 @@ impl Store {
         conn.execute(
             "UPDATE tasks SET state='cancel',
                     finished_at=CASE WHEN state='wait' THEN ?1 ELSE finished_at END,
-                    error=CASE WHEN state='run' THEN 'cancel requested' ELSE error END
+                    error=CASE WHEN state='run' THEN 'cancel requested' ELSE error END,
+                    cancel_confirmed=CASE WHEN state='wait' THEN 1 ELSE cancel_confirmed END,
+                    completion_reason=CASE WHEN state='wait' THEN 'cancelled_before_start' ELSE NULL END
              WHERE id=?2 AND state IN ('wait','run')",
             params![now_string(), id],
         )?;
@@ -307,14 +314,24 @@ impl Store {
     }
 
     pub fn complete(&self, result: &TaskResult) -> Result<Option<Task>> {
+        anyhow::ensure!(
+            matches!(
+                result.state,
+                TaskState::Done | TaskState::Fail | TaskState::Cancel | TaskState::TimedOut
+            ),
+            "completion must report a terminal execution state"
+        );
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
             "UPDATE tasks SET state=CASE WHEN state='cancel' THEN 'cancel' ELSE ?1 END,
                     finished_at=?2, exit_code=?3,
-                    error=CASE WHEN state='cancel' THEN error ELSE ?4 END,
-                    lease_id=NULL, lease_expires_at=NULL
+                    error=?4,
+                    lease_id=NULL, lease_expires_at=NULL,
+                    cancel_confirmed=CASE WHEN state='cancel' OR ?1='cancel' THEN 1 ELSE 0 END,
+                    completion_reason='node_completion'
              WHERE id=?5 AND state IN ('run','cancel')
-               AND lease_id=?6
+               AND (lease_id=?6 OR (state='cancel' AND completion_reason='lease_expired'
+                    AND lease_id IS NULL AND ?6='tri-' || id || '-attempt-' || attempt))
                AND attempt=?7",
             params![
                 result.state.as_str(),
@@ -404,7 +421,7 @@ impl Store {
         let now = crate::now_seconds();
         let changed = conn.execute(
             "UPDATE tasks SET lease_expires_at=?1
-             WHERE id=?2 AND state='run' AND lease_id=?3
+             WHERE id=?2 AND state IN ('run','cancel') AND lease_id=?3
                AND lease_expires_at IS NOT NULL
                AND CAST(lease_expires_at AS INTEGER) >= ?4",
             params![(now + LEASE_SECONDS).to_string(), id, lease_id, now],
@@ -432,7 +449,7 @@ impl Store {
                 conn.execute(
                     "UPDATE tasks SET state='wait', node=NULL, assigned_cpus=NULL,
                             assigned_gpus=NULL, started_at=NULL, lease_id=NULL,
-                            lease_expires_at=NULL, error=?1
+                            lease_expires_at=NULL, error=?1, completion_reason='lease_expired'
                      WHERE id=?2 AND state='run' AND lease_id=?3
                        AND CAST(lease_expires_at AS INTEGER) < ?4",
                     params!["attempt lost; requeued", task.id, lease_id, now],
@@ -441,7 +458,7 @@ impl Store {
                 conn.execute(
                     "UPDATE tasks SET state=?1, finished_at=?2,
                             lease_id=NULL, lease_expires_at=NULL,
-                            error=CASE WHEN state='cancel' THEN error ELSE ?3 END
+                            error=?3, completion_reason='lease_expired', cancel_confirmed=0
                      WHERE id=?4 AND state IN ('run','cancel') AND lease_id=?5
                        AND CAST(lease_expires_at AS INTEGER) < ?6",
                     params![
@@ -519,6 +536,8 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         lease_id: row.get(14)?,
         lease_expires_at: row.get(15)?,
         external_id: row.get(16)?,
+        cancel_confirmed: row.get::<_, i64>("cancel_confirmed")? != 0,
+        completion_reason: row.get("completion_reason")?,
     })
 }
 
@@ -595,6 +614,13 @@ mod tests {
         let cancelled = store.cancel(task.id).unwrap().unwrap();
         assert_eq!(cancelled.state, TaskState::Cancel);
         assert!(cancelled.finished_at.is_none());
+        assert!(cancelled.reserves_resources());
+        assert!(!cancelled.cancel_confirmed);
+        assert!(
+            store
+                .renew_lease(task.id, cancelled.lease_id.as_deref().unwrap())
+                .unwrap()
+        );
         let finished = store
             .complete(&TaskResult {
                 id: task.id,
@@ -608,6 +634,72 @@ mod tests {
             .unwrap();
         assert_eq!(finished.state, TaskState::Cancel);
         assert!(finished.finished_at.is_some());
+        assert!(finished.cancel_confirmed);
+        assert!(!finished.reserves_resources());
+        assert_eq!(finished.error.as_deref(), Some("terminated"));
+        assert_eq!(
+            finished.completion_reason.as_deref(),
+            Some("node_completion")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_cancel_is_not_reported_as_confirmed_stop() {
+        let root =
+            std::env::temp_dir().join(format!("tri-cancel-expiry-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
+        let task = store
+            .submit(TaskSpec {
+                name: "cancel-expiry".into(),
+                command: vec!["sleep".into(), "10".into()],
+                external_id: None,
+                timeout_seconds: None,
+                requested_cpu: 1,
+                requested_mem_bytes: 1,
+                requested_gpus: 0,
+                scratch_cwd: false,
+                requested_node: None,
+                cwd: None,
+                env: Vec::new(),
+                output_path: None,
+                error_path: None,
+                depends_on: Vec::new(),
+                max_attempts: 1,
+            })
+            .unwrap();
+        let claimed = store.claim(task.id, "fed1", "0-0", "").unwrap().unwrap();
+        store.cancel(task.id).unwrap();
+        store.reap_expired(crate::now_seconds() + 100).unwrap();
+        let expired = store.get(task.id).unwrap().unwrap();
+        assert_eq!(expired.state, TaskState::Cancel);
+        assert!(!expired.cancel_confirmed);
+        assert!(expired.finished_at.is_some());
+        assert!(expired.lease_id.is_none());
+        assert_eq!(expired.completion_reason.as_deref(), Some("lease_expired"));
+        assert_eq!(expired.error.as_deref(), Some("node heartbeat expired"));
+        // A delayed report for this exact cancelled attempt can still confirm
+        // stopping, even if the server already closed its lease.
+        let mut result = TaskResult {
+            id: task.id,
+            state: TaskState::Cancel,
+            exit_code: None,
+            error: None,
+            attempt: claimed.attempt,
+            lease_id: Some("wrong-lease".into()),
+        };
+        assert!(!store.complete(&result).unwrap().unwrap().cancel_confirmed);
+        result.lease_id = claimed.lease_id;
+        let confirmed = store.complete(&result).unwrap().unwrap();
+        assert!(confirmed.cancel_confirmed);
+        assert_eq!(
+            confirmed.completion_reason.as_deref(),
+            Some("node_completion")
+        );
+        drop(store);
+        let reopened = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
+        assert!(reopened.get(task.id).unwrap().unwrap().cancel_confirmed);
         let _ = std::fs::remove_dir_all(root);
     }
 

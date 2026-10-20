@@ -92,6 +92,24 @@ pub struct Task {
     pub lease_id: Option<String>,
     #[serde(default)]
     pub lease_expires_at: Option<String>,
+    /// A running cancellation is only terminal after the node reports that
+    /// its process was stopped. Lease expiry deliberately leaves this false.
+    #[serde(default)]
+    pub cancel_confirmed: bool,
+    /// node_completion, cancelled_before_start, or lease_expired.
+    /// None means no completion reason was recorded (including legacy data).
+    #[serde(default)]
+    pub completion_reason: Option<String>,
+}
+
+impl Task {
+    /// Allocations are owned by attempts, not by historical CPU/GPU fields.
+    /// Expiry is processed by the store, never inferred from wall time here.
+    pub fn reserves_resources(&self) -> bool {
+        matches!(self.state, TaskState::Run | TaskState::Cancel)
+            && self.lease_id.is_some()
+            && self.finished_at.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

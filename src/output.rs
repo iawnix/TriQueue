@@ -34,6 +34,12 @@ pub fn tasks(tasks: &[Task]) {
 pub fn task(task: &Task) {
     println!("{}", format!("Task {}", task.id).bold());
     println!("  state:   {}", colored_state(&task.state));
+    if task.state == TaskState::Cancel {
+        println!("  cancel confirmed: {}", task.cancel_confirmed);
+    }
+    if let Some(reason) = &task.completion_reason {
+        println!("  completion reason: {reason}");
+    }
     println!("  name:    {}", task.spec.name);
     println!("  node:    {}", task.node.as_deref().unwrap_or("--"));
     println!(
