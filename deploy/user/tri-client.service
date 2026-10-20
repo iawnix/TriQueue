@@ -1,0 +1,12 @@
+[Unit]
+Description=TriQueue compute client
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/tri/client.env
+ExecStart=%h/.cargo/bin/tri-client
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

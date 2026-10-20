@@ -2,7 +2,7 @@
 name = "tri"
 version = "0.1.0"
 edition = "2024"
-description = "A small two-node task queue for the 3w cluster"
+description = "A lightweight task queue for small Linux clusters"
 license = "MIT"
 
 [lib]

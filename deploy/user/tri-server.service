@@ -1,0 +1,18 @@
+[Unit]
+Description=TriQueue server
+
+[Service]
+Type=simple
+RuntimeDirectory=tri
+RuntimeDirectoryMode=0700
+Environment=TRI_SOCKET=%t/tri/server.sock
+Environment=TRI_DATA_DIR=%h/.local/state/tri
+Environment=TRI_DB=%h/.local/state/tri/tri.db
+EnvironmentFile=%h/.config/tri/server.env
+ExecStart=%h/.cargo/bin/tri-server
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=default.target
