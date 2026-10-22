@@ -40,6 +40,10 @@ pub fn task(task: &Task) {
     if let Some(reason) = &task.completion_reason {
         println!("  completion reason: {reason}");
     }
+    println!("  attempt: {}", task.attempt);
+    if task.recovery_pending {
+        println!("  recovery: execution uncertain; resources retained, node quarantined");
+    }
     println!("  name:    {}", task.spec.name);
     println!("  node:    {}", task.node.as_deref().unwrap_or("--"));
     println!(
@@ -82,8 +86,16 @@ pub fn nodes(nodes: &[NodeInfo]) {
     let mut sorted = nodes.to_vec();
     sorted.sort_by(|left, right| left.name.cmp(&right.name));
     for node in sorted {
-        let label = if node.online { "up" } else { "down" };
-        let state = if node.online {
+        let label = if node.quarantined {
+            "hold"
+        } else if node.online {
+            "up"
+        } else {
+            "down"
+        };
+        let state = if node.quarantined {
+            label.yellow().bold().to_string()
+        } else if node.online {
             label.green().to_string()
         } else {
             label.red().bold().to_string()
@@ -108,9 +120,10 @@ pub fn nodes(nodes: &[NodeInfo]) {
 
 /// Show the scheduler queue and a compact count of every task state.
 pub fn queue(items: &[Task]) {
-    let mut counts = [0usize; 8];
+    let mut counts = [0usize; 9];
     for task in items {
         let index = match &task.state {
+            TaskState::Unknown => 8,
             TaskState::Wait => 0,
             TaskState::Run => 1,
             TaskState::Done => 2,
@@ -123,7 +136,7 @@ pub fn queue(items: &[Task]) {
         counts[index] += 1;
     }
     println!(
-        "Queue  {} total   {} wait   {} run   {} done   {} fail   {} cancel   {} lost   {} blocked   {} timed_out",
+        "Queue  {} total   {} wait   {} run   {} done   {} fail   {} cancel   {} lost   {} blocked   {} timed_out   {} unknown",
         items.len(),
         counts[0],
         counts[1],
@@ -132,11 +145,12 @@ pub fn queue(items: &[Task]) {
         counts[4],
         counts[5],
         counts[6],
-        counts[7]
+        counts[7],
+        counts[8]
     );
     let active: Vec<_> = items
         .iter()
-        .filter(|task| matches!(&task.state, TaskState::Wait | TaskState::Run))
+        .filter(|task| task.state == TaskState::Wait || task.reserves_resources())
         .cloned()
         .collect();
     if active.is_empty() {
@@ -148,6 +162,7 @@ pub fn queue(items: &[Task]) {
 
 pub fn colored_state(state: &TaskState) -> String {
     match state {
+        TaskState::Unknown => "unknown".magenta().bold().to_string(),
         TaskState::Wait => "wait".yellow().to_string(),
         TaskState::Run => "run".cyan().bold().to_string(),
         TaskState::Done => "done".green().to_string(),

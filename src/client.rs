@@ -17,11 +17,15 @@ pub async fn local(request: &Request) -> Result<Response> {
 }
 
 pub async fn tcp(request: &Request) -> Result<Response> {
-    let addr = tcp_addr();
-    let stream = TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("connecting to {addr}"))?;
-    exchange(stream, request).await
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let addr = tcp_addr();
+        let stream = TcpStream::connect(&addr)
+            .await
+            .with_context(|| format!("connecting to {addr}"))?;
+        exchange(stream, request).await
+    })
+    .await
+    .context("server request timed out after 5 seconds")?
 }
 
 pub async fn exchange<S>(mut stream: S, request: &Request) -> Result<Response>

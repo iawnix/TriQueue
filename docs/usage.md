@@ -163,10 +163,16 @@ Repeat `--after` to require multiple tasks. A prerequisite in `fail`, `cancel`,
 `lost`, `blocked`, or `timed_out` blocks the dependent task. Removing a
 prerequisite's record before the dependent task is scheduled also blocks it.
 
-`--max-attempts N` permits another attempt after a node lease expires. The
-number includes the initial attempt and defaults to one. It does not retry
-ordinary command failures. Lease expiry does not prove the old process has
-stopped, so enable retries only for jobs that tolerate repeated execution.
+Lease expiry moves a running task to `unknown` and quarantines its node while
+keeping resources reserved. It never automatically starts a duplicate. A
+matching heartbeat can recover the same attempt. If recovery is impossible,
+verify the old execution cannot run again before using
+[`tri_stat --confirm-stopped`](reference.md#leases-and-resource-enforcement).
+
+`--max-attempts N` bounds explicit retries after a confirmed stop. The number
+includes the initial attempt and defaults to one. Ordinary command failures
+are not automatically retried. `tri_stat ID --history` and `--events` show the
+execution records and transitions.
 
 ## Inspect and cancel work
 

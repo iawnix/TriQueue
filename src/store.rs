@@ -1,11 +1,11 @@
-use crate::model::{Task, TaskId, TaskResult, TaskSpec, TaskState};
+use crate::model::{Task, TaskEvent, TaskHistory, TaskId, TaskResult, TaskSpec, TaskState};
 use crate::{ensure_parent, now_string};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const LEASE_SECONDS: u64 = 10;
+pub const LEASE_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencyStatus {
@@ -69,6 +69,7 @@ impl Store {
             ("external_id", "TEXT"),
             ("cancel_confirmed", "INTEGER NOT NULL DEFAULT 0"),
             ("completion_reason", "TEXT"),
+            ("recovery_pending", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name=?1",
@@ -87,6 +88,7 @@ impl Store {
              ON tasks(external_id) WHERE external_id IS NOT NULL",
             [],
         )?;
+        install_history(&conn)?;
         std::fs::create_dir_all(data_dir.join("tasks"))?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -288,7 +290,8 @@ impl Store {
         let changed = conn.execute(
             "UPDATE tasks SET state='run', node=?1, assigned_cpus=?2, assigned_gpus=?3,
                     started_at=?4, attempt=?5, lease_id=?6, lease_expires_at=?7,
-                    completion_reason=NULL, cancel_confirmed=0
+                    completion_reason=NULL, cancel_confirmed=0, recovery_pending=0,
+                    finished_at=NULL, exit_code=NULL, error=NULL
              WHERE id=?8 AND state='wait'",
             params![
                 node,
@@ -310,10 +313,10 @@ impl Store {
         conn.execute(
             "UPDATE tasks SET state='cancel',
                     finished_at=CASE WHEN state='wait' THEN ?1 ELSE finished_at END,
-                    error=CASE WHEN state='run' THEN 'cancel requested' ELSE error END,
+                    error=CASE WHEN state IN ('run','unknown') THEN 'cancel requested' ELSE error END,
                     cancel_confirmed=CASE WHEN state='wait' THEN 1 ELSE cancel_confirmed END,
                     completion_reason=CASE WHEN state='wait' THEN 'cancelled_before_start' ELSE NULL END
-             WHERE id=?2 AND state IN ('wait','run')",
+             WHERE id=?2 AND state IN ('wait','run','unknown')",
             params![now_string(), id],
         )?;
         drop(conn);
@@ -335,10 +338,9 @@ impl Store {
                     error=?4,
                     lease_id=NULL, lease_expires_at=NULL,
                     cancel_confirmed=CASE WHEN state='cancel' OR ?1='cancel' THEN 1 ELSE 0 END,
-                    completion_reason='node_completion'
-             WHERE id=?5 AND state IN ('run','cancel')
-               AND (lease_id=?6 OR (state='cancel' AND completion_reason='lease_expired'
-                    AND lease_id IS NULL AND ?6='tri-' || id || '-attempt-' || attempt))
+                    completion_reason='node_completion', recovery_pending=0
+             WHERE id=?5 AND state IN ('run','unknown','cancel')
+               AND lease_id=?6
                AND attempt=?7",
             params![
                 result.state.as_str(),
@@ -362,12 +364,12 @@ impl Store {
             tx.execute(
                 "DELETE FROM tasks
                  WHERE state IN ('done','fail','cancel','lost','blocked','timed_out')
-                   AND finished_at IS NOT NULL AND CAST(finished_at AS INTEGER) < CAST(?1 AS INTEGER)",
+                   AND finished_at IS NOT NULL AND lease_id IS NULL AND CAST(finished_at AS INTEGER) < CAST(?1 AS INTEGER)",
                 params![cutoff],
             )?
         } else {
             tx.execute(
-                "DELETE FROM tasks WHERE state IN ('done','fail','cancel','lost','blocked','timed_out')",
+                "DELETE FROM tasks WHERE state IN ('done','fail','cancel','lost','blocked','timed_out') AND finished_at IS NOT NULL AND lease_id IS NULL",
                 [],
             )?
         };
@@ -393,7 +395,7 @@ impl Store {
                 .unwrap_or_else(|| "missing".into());
             match state.as_str() {
                 "done" => {}
-                "wait" | "run" => waiting = true,
+                "wait" | "run" | "unknown" => waiting = true,
                 "missing" => {
                     return Ok(DependencyStatus::Blocked(format!(
                         "dependency task {dependency} is missing"
@@ -424,70 +426,227 @@ impl Store {
     }
 
     pub fn renew_lease(&self, id: TaskId, lease_id: &str) -> Result<bool> {
+        // Reap first so even a heartbeat arriving between sweeps records the gap.
+        self.reap_expired(crate::now_seconds())?;
         let conn = self.conn.lock().expect("store mutex poisoned");
-        let now = crate::now_seconds();
         let changed = conn.execute(
-            "UPDATE tasks SET lease_expires_at=?1
-             WHERE id=?2 AND state IN ('run','cancel') AND lease_id=?3
-               AND lease_expires_at IS NOT NULL
-               AND CAST(lease_expires_at AS INTEGER) >= ?4",
-            params![(now + LEASE_SECONDS).to_string(), id, lease_id, now],
+            "UPDATE tasks SET lease_expires_at=?1,
+                    state=CASE WHEN state='unknown' THEN 'run' ELSE state END,
+                    error=CASE WHEN recovery_pending=1 THEN NULL ELSE error END,
+                    recovery_pending=0
+             WHERE id=?2 AND state IN ('run','unknown','cancel') AND lease_id=?3
+               AND finished_at IS NULL",
+            params![
+                (crate::now_seconds() + LEASE_SECONDS).to_string(),
+                id,
+                lease_id
+            ],
         )?;
         Ok(changed != 0)
     }
 
     pub fn reap_expired(&self, now: u64) -> Result<Vec<Task>> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
         let expired = {
-            let conn = self.conn.lock().expect("store mutex poisoned");
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT * FROM tasks WHERE state IN ('run','cancel')
                  AND lease_expires_at IS NOT NULL AND CAST(lease_expires_at AS INTEGER) < ?1",
             )?;
             stmt.query_map(params![now], row_to_task)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut reaped = Vec::new();
+        tx.execute(
+            "UPDATE tasks SET state=CASE WHEN state='cancel' THEN 'cancel' ELSE 'unknown' END,
+                    recovery_pending=1, lease_expires_at=NULL,
+                    error='node heartbeat expired; execution not confirmed stopped'
+             WHERE state IN ('run','cancel') AND lease_expires_at IS NOT NULL
+               AND CAST(lease_expires_at AS INTEGER) < ?1",
+            params![now],
+        )?;
+        tx.commit()?;
         for task in &expired {
-            let conn = self.conn.lock().expect("store mutex poisoned");
-            let Some(lease_id) = task.lease_id.as_deref() else {
-                continue;
-            };
-            let changed = if task.state == TaskState::Run && task.attempt < task.spec.max_attempts {
-                conn.execute(
-                    "UPDATE tasks SET state='wait', node=NULL, assigned_cpus=NULL,
-                            assigned_gpus=NULL, started_at=NULL, lease_id=NULL,
-                            lease_expires_at=NULL, error=?1, completion_reason='lease_expired'
-                     WHERE id=?2 AND state='run' AND lease_id=?3
-                       AND CAST(lease_expires_at AS INTEGER) < ?4",
-                    params!["attempt lost; requeued", task.id, lease_id, now],
-                )?
-            } else {
-                conn.execute(
-                    "UPDATE tasks SET state=?1, finished_at=?2,
-                            lease_id=NULL, lease_expires_at=NULL,
-                            error=?3, completion_reason='lease_expired', cancel_confirmed=0
-                     WHERE id=?4 AND state IN ('run','cancel') AND lease_id=?5
-                       AND CAST(lease_expires_at AS INTEGER) < ?6",
-                    params![
-                        if task.state == TaskState::Cancel {
-                            "cancel"
-                        } else {
-                            "lost"
-                        },
-                        now_string(),
-                        "node heartbeat expired",
-                        task.id,
-                        lease_id,
-                        now
-                    ],
-                )?
-            };
-            if changed != 0 {
-                reaped.push(task.clone());
-            }
+            tracing::warn!(task=task.id, attempt=task.attempt, node=?task.node,
+                "task lease expired; allocation retained and node quarantined");
         }
-        Ok(reaped)
+        Ok(expired)
     }
+
+    /// Operator assertion: the old execution has stopped and cannot start late.
+    /// This must never be inferred from a missing heartbeat or unit listing.
+    pub fn confirm_stopped(
+        &self,
+        id: TaskId,
+        attempt: u32,
+        reason: &str,
+        retry: bool,
+    ) -> Result<Task> {
+        anyhow::ensure!(!reason.trim().is_empty(), "reason must not be empty");
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let task = tx
+            .query_row("SELECT * FROM tasks WHERE id=?1", [id], row_to_task)
+            .optional()?
+            .context("task does not exist")?;
+        anyhow::ensure!(
+            task.attempt == attempt && task.recovery_pending && task.reserves_resources(),
+            "task is not an unresolved execution of attempt {attempt}"
+        );
+        anyhow::ensure!(
+            !retry || (task.state != TaskState::Cancel && attempt < task.spec.max_attempts),
+            "retry requires an uncancelled attempt below max_attempts"
+        );
+        tx.execute(
+            "UPDATE tasks SET state=CASE WHEN state='cancel' THEN 'cancel' ELSE 'lost' END,
+                    finished_at=?1, error=?2, completion_reason='operator_confirmed_stopped',
+                    cancel_confirmed=CASE WHEN state='cancel' THEN 1 ELSE 0 END,
+                    lease_id=NULL, lease_expires_at=NULL, recovery_pending=0 WHERE id=?3",
+            params![now_string(), reason, id],
+        )?;
+        if retry {
+            // The terminal attempt is archived by the trigger before requeuing.
+            tx.execute(
+                "UPDATE tasks SET state='wait', node=NULL, assigned_cpus=NULL,
+                    assigned_gpus=NULL, started_at=NULL, finished_at=NULL,
+                    exit_code=NULL, error=NULL, completion_reason=NULL WHERE id=?1",
+                [id],
+            )?;
+        }
+        let task = tx.query_row("SELECT * FROM tasks WHERE id=?1", [id], row_to_task)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    pub fn history(&self, id: TaskId) -> Result<TaskHistory> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(exists, "task {id} does not exist");
+        let mut stmt =
+            conn.prepare("SELECT snapshot FROM task_attempts WHERE task_id=?1 ORDER BY attempt")?;
+        let snapshots = stmt
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let attempts = snapshots
+            .iter()
+            .map(|s| serde_json::from_str(s))
+            .collect::<serde_json::Result<Vec<Task>>>()?;
+        let mut stmt = conn.prepare("SELECT id, task_id, attempt, at, kind, from_state, to_state, detail FROM task_events WHERE task_id=?1 ORDER BY id")?;
+        let events = stmt
+            .query_map([id], |row| {
+                Ok(TaskEvent {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    attempt: row.get(2)?,
+                    at: row.get(3)?,
+                    kind: row.get(4)?,
+                    from_state: row.get(5)?,
+                    to_state: row.get(6)?,
+                    detail: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(TaskHistory { attempts, events })
+    }
+}
+
+/// Triggers keep audit writes in the same SQLite transaction as state changes,
+/// including cancellation and migration. Heartbeat-only updates create no events.
+fn install_history(conn: &Connection) -> Result<()> {
+    fn snapshot(prefix: &str, old: Option<&str>) -> String {
+        let fields = [
+            "id",
+            "state",
+            "node",
+            "assigned_cpus",
+            "assigned_gpus",
+            "created_at",
+            "started_at",
+            "finished_at",
+            "exit_code",
+            "stdout_path",
+            "stderr_path",
+            "error",
+            "external_id",
+            "attempt",
+            "lease_id",
+            "lease_expires_at",
+            "completion_reason",
+        ];
+        let mut values = vec![format!("'spec',json({prefix}.spec_json)")];
+        for field in fields {
+            let value = if field == "lease_id" {
+                old.map_or_else(|| format!("{prefix}.{field}"), |old|
+                    format!("COALESCE({prefix}.{field},CASE WHEN {old}.attempt={prefix}.attempt THEN {old}.{field} END)"))
+            } else {
+                format!("{prefix}.{field}")
+            };
+            values.push(format!("'{field}',{value}"));
+        }
+        for field in ["cancel_confirmed", "recovery_pending"] {
+            values.push(format!(
+                "'{field}',json(CASE WHEN {prefix}.{field} THEN 'true' ELSE 'false' END)"
+            ));
+        }
+        format!("json_object({})", values.join(","))
+    }
+    let initial = snapshot("t", None);
+    let updated = snapshot("NEW", Some("OLD"));
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS task_attempts (
+            task_id INTEGER NOT NULL, attempt INTEGER NOT NULL, snapshot TEXT NOT NULL,
+            PRIMARY KEY(task_id, attempt)
+         );
+         CREATE TABLE IF NOT EXISTS task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+            attempt INTEGER NOT NULL, at TEXT NOT NULL, kind TEXT NOT NULL,
+            from_state TEXT, to_state TEXT NOT NULL, detail TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, id);
+         INSERT OR IGNORE INTO task_attempts SELECT t.id, t.attempt, {initial}
+            FROM tasks t WHERE t.attempt > 0 AND t.state != 'wait';
+         INSERT INTO task_events (task_id, attempt, at, kind, to_state, detail)
+            SELECT id, attempt, CAST(strftime('%s','now') AS TEXT), 'baseline', state,
+                'Imported current state; older execution history is unavailable'
+            FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.id);
+         CREATE TRIGGER IF NOT EXISTS task_submitted AFTER INSERT ON tasks BEGIN
+            INSERT INTO task_events (task_id, attempt, at, kind, to_state)
+            VALUES (NEW.id, NEW.attempt, NEW.created_at, 'submitted', NEW.state);
+         END;
+         CREATE TRIGGER IF NOT EXISTS task_changed AFTER UPDATE ON tasks
+         WHEN OLD.state IS NOT NEW.state OR OLD.attempt IS NOT NEW.attempt
+           OR OLD.recovery_pending IS NOT NEW.recovery_pending
+           OR OLD.finished_at IS NOT NEW.finished_at
+           OR OLD.cancel_confirmed IS NOT NEW.cancel_confirmed
+         BEGIN
+            INSERT INTO task_attempts (task_id, attempt, snapshot)
+                SELECT NEW.id, NEW.attempt, {updated}
+                WHERE NEW.attempt > 0 AND NEW.state != 'wait'
+                  AND (OLD.state != 'wait' OR NEW.attempt > OLD.attempt)
+                ON CONFLICT(task_id, attempt) DO UPDATE SET snapshot=excluded.snapshot;
+            INSERT INTO task_events (task_id, attempt, at, kind, from_state, to_state, detail)
+            VALUES (NEW.id, NEW.attempt, CAST(strftime('%s','now') AS TEXT),
+                CASE WHEN NEW.recovery_pending=1 AND OLD.recovery_pending=0 THEN 'lease_expired'
+                     WHEN NEW.completion_reason='operator_confirmed_stopped' THEN 'confirmed_stopped'
+                     WHEN NEW.finished_at IS NOT NULL THEN 'completed'
+                     WHEN OLD.recovery_pending=1 AND NEW.recovery_pending=0 THEN 'recovered'
+                     WHEN NEW.attempt > OLD.attempt THEN 'claimed'
+                     WHEN NEW.state='wait' THEN 'requeued'
+                     WHEN NEW.state='cancel' THEN 'cancel_requested'
+                     ELSE 'state_changed' END,
+                OLD.state, NEW.state, NEW.error);
+         END;
+         CREATE TRIGGER IF NOT EXISTS task_deleted AFTER DELETE ON tasks BEGIN
+            DELETE FROM task_attempts WHERE task_id=OLD.id;
+            DELETE FROM task_events WHERE task_id=OLD.id;
+         END;
+         COMMIT;"
+    ))?;
+    Ok(())
 }
 
 fn resolve_log_path(
@@ -521,6 +680,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         state: match state.as_str() {
             "wait" => TaskState::Wait,
             "run" => TaskState::Run,
+            "unknown" => TaskState::Unknown,
             "done" => TaskState::Done,
             "fail" => TaskState::Fail,
             "cancel" => TaskState::Cancel,
@@ -545,6 +705,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         external_id: row.get(16)?,
         cancel_confirmed: row.get::<_, i64>("cancel_confirmed")? != 0,
         completion_reason: row.get("completion_reason")?,
+        recovery_pending: row.get("recovery_pending")?,
     })
 }
 
@@ -682,12 +843,14 @@ mod tests {
         let expired = store.get(task.id).unwrap().unwrap();
         assert_eq!(expired.state, TaskState::Cancel);
         assert!(!expired.cancel_confirmed);
-        assert!(expired.finished_at.is_some());
-        assert!(expired.lease_id.is_none());
-        assert_eq!(expired.completion_reason.as_deref(), Some("lease_expired"));
-        assert_eq!(expired.error.as_deref(), Some("node heartbeat expired"));
-        // A delayed report for this exact cancelled attempt can still confirm
-        // stopping, even if the server already closed its lease.
+        assert!(expired.finished_at.is_none());
+        assert_eq!(expired.lease_id, claimed.lease_id);
+        assert!(expired.recovery_pending);
+        assert!(expired.reserves_resources());
+        assert!(expired.completion_reason.is_none());
+        assert_eq!(store.clean(None).unwrap(), 0);
+        assert_eq!(store.clean(Some(0)).unwrap(), 0);
+        // A delayed report for this exact cancelled attempt confirms stopping.
         let mut result = TaskResult {
             id: task.id,
             state: TaskState::Cancel,
@@ -776,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_lease_is_lost_or_requeued() {
+    fn expired_lease_retains_allocation_until_confirmed_stopped() {
         let root = std::env::temp_dir().join(format!("tri-lease-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
@@ -801,7 +964,26 @@ mod tests {
             .unwrap();
         store.claim(lost.id, "fed1", "0-0", "").unwrap();
         store.reap_expired(crate::now_seconds() + 100).unwrap();
-        assert_eq!(store.get(lost.id).unwrap().unwrap().state, TaskState::Lost);
+        let unresolved = store.get(lost.id).unwrap().unwrap();
+        assert_eq!(unresolved.state, TaskState::Unknown);
+        assert!(unresolved.reserves_resources());
+        assert!(store.claim(lost.id, "fed2", "0-0", "").unwrap().is_none());
+        assert!(
+            store
+                .confirm_stopped(lost.id, 2, "node powered off", false)
+                .is_err()
+        );
+        assert!(store.confirm_stopped(lost.id, 1, " ", false).is_err());
+        assert!(
+            store
+                .confirm_stopped(lost.id, 1, "node powered off", true)
+                .is_err()
+        );
+        let resolved = store
+            .confirm_stopped(lost.id, 1, "node powered off", false)
+            .unwrap();
+        assert_eq!(resolved.state, TaskState::Lost);
+        assert!(!resolved.reserves_resources());
 
         let retry = store
             .submit(TaskSpec {
@@ -825,13 +1007,24 @@ mod tests {
         store.claim(retry.id, "fed1", "0-0", "").unwrap();
         store.reap_expired(crate::now_seconds() + 100).unwrap();
         let retry = store.get(retry.id).unwrap().unwrap();
+        assert_eq!(retry.state, TaskState::Unknown);
+        assert!(retry.reserves_resources());
+        let retry = store
+            .confirm_stopped(retry.id, 1, "node powered off", true)
+            .unwrap();
         assert_eq!(retry.state, TaskState::Wait);
         assert_eq!(retry.attempt, 1);
+        // Cancelling a requeued task before its next claim must not rewrite
+        // the previous terminal attempt with this queue-only cancellation.
+        let before = serde_json::to_value(store.history(retry.id).unwrap().attempts).unwrap();
+        store.cancel(retry.id).unwrap();
+        let after = serde_json::to_value(store.history(retry.id).unwrap().attempts).unwrap();
+        assert_eq!(before, after);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn expired_lease_cannot_be_renewed() {
+    fn matching_lease_can_recover_the_same_attempt() {
         let root = std::env::temp_dir().join(format!("tri-renew-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
@@ -863,11 +1056,34 @@ mod tests {
             )
             .unwrap();
         }
+        assert!(!store.renew_lease(task.id, "wrong-lease").unwrap());
+        assert_eq!(
+            store.get(task.id).unwrap().unwrap().state,
+            TaskState::Unknown
+        );
         assert!(
-            !store
+            store
                 .renew_lease(task.id, claimed.lease_id.as_deref().unwrap())
                 .unwrap()
         );
+        let recovered = store.get(task.id).unwrap().unwrap();
+        assert_eq!(recovered.state, TaskState::Run);
+        assert_eq!(recovered.attempt, claimed.attempt);
+        assert_eq!(recovered.lease_id, claimed.lease_id);
+        assert!(!recovered.recovery_pending);
+        assert!(
+            store
+                .confirm_stopped(task.id, 1, "obsolete observation", true)
+                .is_err()
+        );
+        let count = store.history(task.id).unwrap().events.len();
+        store
+            .renew_lease(task.id, claimed.lease_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(store.history(task.id).unwrap().events.len(), count);
+        let history = store.history(task.id).unwrap();
+        assert!(history.events.iter().any(|e| e.kind == "lease_expired"));
+        assert_eq!(history.events.last().unwrap().kind, "recovered");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -898,6 +1114,15 @@ mod tests {
             .unwrap();
         let first = store.claim(task.id, "fed1", "0-0", "").unwrap().unwrap();
         store.reap_expired(crate::now_seconds() + 100).unwrap();
+        assert!(store.claim(task.id, "fed2", "0-0", "").unwrap().is_none());
+        store
+            .confirm_stopped(
+                task.id,
+                first.attempt,
+                "old node fenced and powered off",
+                true,
+            )
+            .unwrap();
         let second = store.claim(task.id, "fed2", "0-0", "").unwrap().unwrap();
         store
             .complete(&TaskResult {
@@ -906,13 +1131,45 @@ mod tests {
                 exit_code: Some(0),
                 error: None,
                 attempt: first.attempt,
-                lease_id: first.lease_id,
+                lease_id: first.lease_id.clone(),
             })
             .unwrap();
         let current = store.get(second.id).unwrap().unwrap();
         assert_eq!(current.state, TaskState::Run);
         assert_eq!(current.attempt, second.attempt);
         assert_eq!(current.lease_id, second.lease_id);
+        let history = store.history(task.id).unwrap();
+        assert_eq!(history.attempts.len(), 2);
+        assert_eq!(history.attempts[0].state, TaskState::Lost);
+        assert_eq!(history.attempts[0].node.as_deref(), Some("fed1"));
+        assert_eq!(history.attempts[0].lease_id, first.lease_id);
+        assert_eq!(
+            history.attempts[0].error.as_deref(),
+            Some("old node fenced and powered off")
+        );
+        assert_eq!(history.attempts[1].state, TaskState::Run);
+        assert_eq!(
+            history
+                .events
+                .iter()
+                .map(|e| e.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "submitted",
+                "claimed",
+                "lease_expired",
+                "confirmed_stopped",
+                "requeued",
+                "claimed"
+            ]
+        );
+        let serialized = serde_json::to_value(&history).unwrap();
+        drop(store);
+        let reopened = Store::open(&root.join("tri.db"), &root.join("data")).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.history(task.id).unwrap()).unwrap(),
+            serialized
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -59,10 +59,11 @@ GPU visibility variables are set from the scheduler's assignment.
 | --- | --- |
 | `wait` | Queued for resources or prerequisites |
 | `run` | Assigned to a node as an active attempt |
+| `unknown` | Renewal stopped; execution is unresolved and resources remain reserved |
 | `done` | Completed successfully |
 | `fail` | Failed to start or execute, including memory-limit failures |
 | `cancel` | Cancellation requested or completed; inspect confirmation fields |
-| `lost` | The attempt's lease expired with no retry remaining |
+| `lost` | Execution outcome unavailable; operator confirmed the old execution stopped (legacy records may only indicate lease expiry) |
 | `blocked` | A prerequisite did not succeed or its record is missing |
 | `timed_out` | Exceeded the configured runtime limit |
 
@@ -82,6 +83,7 @@ not recorded.
 | `tri_ls --json` | Array of tasks |
 | `tri_stat --json` | Array of tasks in the queue view |
 | `tri_stat ID --json` | One task object |
+| `tri_stat ID --history --json` or `--events --json` | Object with `attempts` and `events` |
 | `tri_stat --external-id ID --json` | One task object |
 | `tri_del ID --json` | Updated task object |
 | `tri_node --json` | Array of node objects |
@@ -90,9 +92,10 @@ not recorded.
 Task objects include `id`, `spec`, `state`, `node`, resource assignments,
 `attempt`, `lease_id`, `lease_expires_at`, timestamps, `exit_code`, `error`,
 `stdout_path`, `stderr_path`, `external_id`, `cancel_confirmed`, and
-`completion_reason`. `spec` contains the submitted command and resource
+`completion_reason`, and `recovery_pending`. `spec` contains the submitted command and resource
 requirements. Node objects report capacities, reservations, running tasks,
-online status, and capabilities.
+online status, `quarantined`, and capabilities. `tri_node` displays quarantined
+nodes as `hold`; `tri_top` labels them `quarantined`. They receive no new tasks.
 
 Handled request errors in JSON mode return an `error` object with `code`,
 `message`, and `retryable`, and exit with status 1. Argument parsing and local
@@ -118,8 +121,8 @@ old identifier after cleanup can create a new task.
 ## Cancellation and resource reservations
 
 Cancelling a queued task finishes it immediately. Cancelling a running task
-keeps its CPU, memory, and GPU reservations until the node reports completion,
-unless the lease expires first. Scheduling, `tri_node`, and `tri_top` derive
+keeps its CPU, memory, and GPU reservations until stopping is confirmed,
+including when the lease expires. Scheduling, `tri_node`, and `tri_top` derive
 reservations from unfinished attempts with a lease. Historical `node`,
 `assigned_cpus`, and `assigned_gpus` fields alone do not reserve capacity.
 
@@ -130,11 +133,13 @@ The task state remains `cancel` in all of these cases:
 | Requested; node has not acknowledged completion | `false` | `null` |
 | Cancelled while queued | `true` | `cancelled_before_start` |
 | Node reported completion after cancellation | `true` | `node_completion` |
-| Cancelled attempt's lease expired | `false` | `lease_expired` |
+| Cancelled attempt's lease expired (`recovery_pending=true`) | `false` | `null` |
+| Operator confirmed the old execution stopped | `true` | `operator_confirmed_stopped` |
 
-Lease expiry closes the scheduler's reservation but does not prove the process
-stopped. Keep execution status unresolved in that case. A delayed completion
-for the same cancelled attempt can subsequently confirm stopping.
+Lease expiry retains the reservation and quarantines the node. It does not
+prove the process stopped. A delayed completion for the same cancelled attempt
+can subsequently confirm stopping. `tri_clean` never removes unfinished
+cancellations or unresolved attempts.
 
 Cancellation heartbeats renew the lease while the node is still stopping the
 task. Failed stop requests are retried. The client retains successful stop
@@ -148,17 +153,53 @@ fields and acknowledgement behavior.
 
 ## Leases and resource enforcement
 
-Each active attempt has a lease renewed by node heartbeats. If renewal stops,
-the attempt becomes `lost`, or returns to `wait` if `--max-attempts` permits
-another attempt. The default is one attempt. Ordinary task failures and runtime
-timeouts do not trigger this lease-based retry mechanism.
+Each active attempt has a 60-second lease renewed by node heartbeats roughly
+every two seconds. Heartbeats run independently of task startup, inspection,
+stopping, and cleanup, and include pending starts and completions awaiting
+acknowledgement. TCP requests time out after five seconds. If renewal stops,
+the attempt becomes `unknown` (`cancel` keeps its cancellation intent), with
+`recovery_pending=true`. Its CPU, memory, GPU, and lease identity remain reserved;
+the whole node is quarantined, even if spare resources exist. Other nodes can
+continue unrelated tasks. Dependencies on an `unknown` task keep waiting.
+Quarantine survives server restart and node registration. A matching lease
+heartbeat from the assigned node restores the same execution; a matching
+completion releases its resources. Neither a missing heartbeat nor absence
+from a unit listing authorizes another execution.
+
+There is no automatic retry on lease expiry. If recovery is impossible, first
+verify the old execution is stopped and cannot launch later (for example,
+fence the old node and disable pending launches). Then record that assertion:
+
+```bash
+tri_stat 123 --confirm-stopped --attempt 1 --reason "old node fenced; pending launches disabled"
+# Add --retry only if another execution is desired and max_attempts permits it.
+tri_stat 124 --confirm-stopped --attempt 1 --reason "old execution stopped and launches disabled" --retry
+```
+
+The exact attempt, unresolved status, and nonempty reason are required. A
+recovered attempt rejects stale operator resolution. Resolution records a
+terminal `lost` attempt (or confirmed `cancel`), then optionally requeues it
+atomically. Cancelled tasks cannot retry; ordinary failures/timeouts do not
+automatically retry either. `--max-attempts` defaults to one and bounds explicit
+retries after a confirmed stop. The command trusts the operator's assertion;
+it does not power off a node or inspect remote processes for you.
+
+A task whose systemd unit disappears is reported as `fail` with an unavailable
+exit status and a specific error. Before reporting any terminal execution, the
+client waits for systemd stop to settle, including control-group cleanup. This
+does not terminate the compute client.
+Temporary inspection errors retain the allocation and are retried; a failed
+inspection alone is not evidence that the task has stopped. Lease expiry and
+reconciliation stops are logged with task identities for diagnosis.
 
 On startup and reconnect, the client reconciles existing systemd task units
 against the server's current attempts. It adopts matching active attempts and
-stops obsolete units. Lease expiry and retries do not provide exactly-once
-execution: an unreachable node may still be running an old process.
+stops obsolete units. This avoids automatic duplicate execution during network
+partitions; it is not an exactly-once guarantee for external side effects.
 
-CPU assignments use systemd `AllowedCPUs`. Every new task reserves memory and
+CPU assignments prefer a contiguous free range. If free CPUs are fragmented,
+the scheduler selects enough distinct free IDs (for example `0,2,4`) and uses
+systemd `AllowedCPUs` to enforce that set. GPU IDs use the same selection rule. Every new task reserves memory and
 uses `MemoryMax` with swap disabled; omitted or zero memory requests become
 1 GiB at submission, before scheduling and idempotency fingerprinting. GPU
 assignments use device rules and visibility variables. The device allowlist
@@ -183,7 +224,36 @@ On reconciliation, active units must have been started through the guard and
 must still have matching CPU and memory constraints. Unsafe legacy units are
 stopped, with their reservation retained until stopping is acknowledged.
 
+## Execution history
+
+```bash
+tri_stat 123 --history
+tri_stat 123 --events
+tri_stat 123 --history --events
+tri_stat 123 --history --json
+```
+
+Attempts retain the command, resource allocation, node, lease identity, times,
+exit code, and completion reason. Requeuing does not overwrite the previous
+attempt. Events record submission, claims, expiry, recovery, cancellation,
+confirmed stops, completion, and requeue in monotonically increasing event-ID
+order. Routine renewals do not create events. Attempt snapshots update at these
+transitions; use the current task object for the latest lease expiry.
+
+History is persisted atomically with task state changes. Migration imports the
+latest available attempt and a `baseline` event; it cannot reconstruct older
+attempts already overwritten by previous releases. Log paths are recorded, but
+history does not make separate copies of log files. Cleaning a terminal task
+also removes its history and submission receipts.
+
 ## Protocol compatibility
+
+This release uses protocol version **2**. Back up the SQLite database with its
+SQLite backup mechanism (or stop the server before copying the database and
+WAL files). Upgrade the server, all clients, and CLI tools together. Version 1
+clients cannot renew leases against a version 2 server; a partial upgrade can
+leave nodes quarantined. Database migration happens automatically on startup.
+Do not roll back only the server binary against the migrated database.
 
 Every connection starts with a `Hello` exchange that checks the protocol
 version and returns server capabilities. A version mismatch produces an

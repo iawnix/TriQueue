@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::fs;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use tri::client;
 use tri::model::TaskSpec;
@@ -30,6 +31,7 @@ struct Args {
     timeout: Option<u64>,
     #[arg(long = "after", value_name = "ID")]
     after: Vec<i64>,
+    /// Maximum executions, including explicit retries after a confirmed stop.
     #[arg(long, default_value_t = 1)]
     max_attempts: u32,
     #[arg(long)]
@@ -157,17 +159,30 @@ fn parse_script_metadata(path: &Path) -> Result<ScriptMetadata> {
     Ok(metadata)
 }
 
-fn script_path(command: &[String]) -> Option<PathBuf> {
-    let candidate = command.first()?;
+fn script_path(command: &[String]) -> Result<Option<PathBuf>> {
+    let Some(candidate) = command.first() else {
+        return Ok(None);
+    };
     let path = Path::new(candidate);
     if path.is_file() {
+        // An explicit executable path is still a command. Do not read ELF
+        // binaries as UTF-8 metadata or wrap them in bash.
+        let mut file =
+            fs::File::open(path).with_context(|| format!("opening command {}", path.display()))?;
+        let mut magic = [0; 4];
+        match file.read_exact(&mut magic) {
+            Ok(()) if magic == *b"\x7fELF" => return Ok(None),
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error).context("reading command header"),
+        }
         if path.is_absolute() {
-            Some(path.to_path_buf())
+            Ok(Some(path.to_path_buf()))
         } else {
-            std::env::current_dir().ok().map(|cwd| cwd.join(path))
+            Ok(Some(std::env::current_dir()?.join(path)))
         }
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -176,7 +191,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     required_command(&args.command)?;
 
-    let script = script_path(&args.command);
+    let script = script_path(&args.command)?;
     let (
         name,
         requested_cpu,
@@ -273,4 +288,39 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_path_is_not_treated_as_a_job_script() {
+        let executable = std::env::current_exe().unwrap();
+        let command = vec![executable.to_string_lossy().into_owned(), "--help".into()];
+        assert!(script_path(&command).unwrap().is_none());
+        assert!(
+            script_path(&["python3".into(), "-c".into(), "pass".into()])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shell_script_still_supplies_job_metadata() {
+        let path = std::env::temp_dir().join(format!("tri-sub-script-{}.sh", std::process::id()));
+        fs::write(
+            &path,
+            "#!/bin/bash\n# tri_cpu: 2\n# tri_mem: 64M\necho ok\n",
+        )
+        .unwrap();
+        let detected = script_path(&[path.to_string_lossy().into_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(detected, path);
+        let metadata = parse_script_metadata(&detected).unwrap();
+        assert_eq!(metadata.cpu, Some(2));
+        assert_eq!(metadata.mem, Some(64 << 20));
+        fs::remove_file(path).unwrap();
+    }
 }

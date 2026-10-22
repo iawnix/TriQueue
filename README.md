@@ -12,7 +12,8 @@ so you can start with one machine and add nodes later.
 
 - CPU allocation, per-task memory limits, and GPU assignment.
 - Job scripts with resource declarations, output paths, and runtime limits.
-- Task dependencies and optional retries after a node's lease expires.
+- Task dependencies, durable execution history, and explicit retries after a confirmed stop.
+- Quarantine for unresolved executions and support for fragmented CPU allocations.
 - Node-local scratch directories for temporary work.
 - JSON output and submission identifiers for workflow integration.
 - A terminal dashboard for inspecting the queue and requesting cancellation.

@@ -225,8 +225,16 @@ fn draw_nodes(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_node_card(frame: &mut ratatui::Frame<'_>, node: &NodeInfo, area: Rect) {
-    let border = if node.online { GREEN } else { RED };
-    let state = if node.online {
+    let border = if node.quarantined {
+        YELLOW
+    } else if node.online {
+        GREEN
+    } else {
+        RED
+    };
+    let state = if node.quarantined {
+        "● quarantined"
+    } else if node.online {
         "● online"
     } else {
         "● offline"
@@ -410,6 +418,7 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 
 fn state_rank(state: &TaskState) -> u8 {
     match state {
+        TaskState::Unknown => 0,
         TaskState::Run => 0,
         TaskState::Wait => 1,
         TaskState::Fail => 2,
@@ -422,6 +431,7 @@ fn state_rank(state: &TaskState) -> u8 {
 }
 fn state_label(state: &TaskState) -> &'static str {
     match state {
+        TaskState::Unknown => "? unknown",
         TaskState::Wait => "· wait",
         TaskState::Run => "▶ run",
         TaskState::Done => "✓ done",
@@ -435,6 +445,7 @@ fn state_label(state: &TaskState) -> &'static str {
 fn task_style(state: &TaskState) -> Style {
     Style::default()
         .fg(match state {
+            TaskState::Unknown => Color::Magenta,
             TaskState::Wait => YELLOW,
             TaskState::Run => CYAN,
             TaskState::Done => GREEN,

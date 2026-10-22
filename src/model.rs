@@ -7,6 +7,7 @@ pub type TaskId = i64;
 pub enum TaskState {
     Wait,
     Run,
+    Unknown,
     Done,
     Fail,
     Cancel,
@@ -21,6 +22,7 @@ impl TaskState {
         match self {
             Self::Wait => "wait",
             Self::Run => "run",
+            Self::Unknown => "unknown",
             Self::Done => "done",
             Self::Fail => "fail",
             Self::Cancel => "cancel",
@@ -96,7 +98,11 @@ pub struct Task {
     /// its process was stopped. Lease expiry deliberately leaves this false.
     #[serde(default)]
     pub cancel_confirmed: bool,
-    /// node_completion, cancelled_before_start, or lease_expired.
+    /// Execution may still exist; retain its allocation until reconciled or stopped.
+    #[serde(default)]
+    pub recovery_pending: bool,
+    /// node_completion, cancelled_before_start, or operator_confirmed_stopped.
+    /// Legacy records may contain lease_expired.
     /// None means no completion reason was recorded (including legacy data).
     #[serde(default)]
     pub completion_reason: Option<String>,
@@ -106,8 +112,10 @@ impl Task {
     /// Allocations are owned by attempts, not by historical CPU/GPU fields.
     /// Expiry is processed by the store, never inferred from wall time here.
     pub fn reserves_resources(&self) -> bool {
-        matches!(self.state, TaskState::Run | TaskState::Cancel)
-            && self.lease_id.is_some()
+        matches!(
+            self.state,
+            TaskState::Run | TaskState::Unknown | TaskState::Cancel
+        ) && self.lease_id.is_some()
             && self.finished_at.is_none()
     }
 }
@@ -122,6 +130,8 @@ pub struct NodeInfo {
     pub gpu_total: u32,
     pub scratch: String,
     pub online: bool,
+    #[serde(default)]
+    pub quarantined: bool,
     pub last_seen: String,
     pub cpu_used: u32,
     pub memory_used: u64,
@@ -192,4 +202,24 @@ pub struct TaskResult {
     pub attempt: u32,
     #[serde(default)]
     pub lease_id: Option<String>,
+}
+
+/// Durable snapshots of executions and their transitions. Earlier attempts are
+/// retained even when the current task is requeued.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskHistory {
+    pub attempts: Vec<Task>,
+    pub events: Vec<TaskEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskEvent {
+    pub id: i64,
+    pub task_id: TaskId,
+    pub attempt: u32,
+    pub at: String,
+    pub kind: String,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub detail: Option<String>,
 }

@@ -66,12 +66,13 @@ fn check_nodes(nodes: &[tri::model::NodeInfo], print_ok: bool) -> Result<()> {
         {
             missing.push("systemd_manager");
         }
-        if !node.online || !missing.is_empty() {
+        if !node.online || node.quarantined || !missing.is_empty() {
             failed = true;
             eprintln!(
-                "{}: unavailable={} missing={}",
+                "{}: unavailable={} quarantined={} missing={}",
                 node.name,
                 !node.online,
+                node.quarantined,
                 if missing.is_empty() {
                     "-".to_owned()
                 } else {

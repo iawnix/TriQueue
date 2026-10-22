@@ -1,7 +1,7 @@
 use crate::model::{NodeHeartbeat, NodeRegistration, ObservedUnit, TaskId, TaskResult, TaskSpec};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub fn capabilities() -> Vec<String> {
     [
@@ -14,6 +14,9 @@ pub fn capabilities() -> Vec<String> {
         "node_capabilities",
         "retention_clean",
         "cancel_confirmation",
+        "node_quarantine",
+        "attempt_history",
+        "fragmented_cpu_allocation",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -38,6 +41,15 @@ pub enum Request {
     },
     Get {
         id: TaskId,
+    },
+    History {
+        id: TaskId,
+    },
+    ConfirmStopped {
+        id: TaskId,
+        attempt: u32,
+        reason: String,
+        retry: bool,
     },
     GetExternal {
         external_id: String,
@@ -82,6 +94,7 @@ pub enum Response {
         created: bool,
     },
     Tasks(Vec<crate::model::Task>),
+    History(crate::model::TaskHistory),
     Nodes(Vec<crate::model::NodeInfo>),
     Assignment(Option<crate::model::TaskAssignment>),
     Heartbeat {

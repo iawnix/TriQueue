@@ -252,6 +252,12 @@ longer match. Stopping a client service alone does not necessarily stop its task
 units. To shut down deliberately, stop submitting work and let jobs finish or
 request cancellation and verify confirmation before stopping the services.
 
+Protocol version 2 adds durable execution history and node quarantine. Back up
+the database and update server, compute clients, and CLI tools together;
+version 1 clients cannot renew against the new server. Expired executions keep
+their reservations and quarantine their node until reconciled or confirmed
+stopped. Node registration alone does not clear this quarantine.
+
 See the [reference](reference.md#leases-and-resource-enforcement) for lease
 expiry, retry behavior, and cancellation migration details.
 

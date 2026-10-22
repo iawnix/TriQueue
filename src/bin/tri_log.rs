@@ -48,15 +48,17 @@ async fn main() -> Result<()> {
             Response::Task(task) => task,
             other => anyhow::bail!("unexpected response: {other:?}"),
         };
-        if matches!(
-            task.state,
-            tri::model::TaskState::Done
-                | tri::model::TaskState::Fail
-                | tri::model::TaskState::Cancel
-                | tri::model::TaskState::Lost
-                | tri::model::TaskState::Blocked
-                | tri::model::TaskState::TimedOut
-        ) {
+        if task.finished_at.is_some()
+            && matches!(
+                task.state,
+                tri::model::TaskState::Done
+                    | tri::model::TaskState::Fail
+                    | tri::model::TaskState::Cancel
+                    | tri::model::TaskState::Lost
+                    | tri::model::TaskState::Blocked
+                    | tri::model::TaskState::TimedOut
+            )
+        {
             break;
         }
         sleep(Duration::from_millis(500)).await;

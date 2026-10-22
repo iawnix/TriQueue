@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::process::Command;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::sync::watch;
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tri::client;
 use tri::model::{
     NodeHeartbeat, NodeRegistration, ObservedUnit, RunningTask, TaskId, TaskResult, TaskState,
@@ -91,19 +92,98 @@ struct LocalTask {
     unit: String,
     lease_id: Option<String>,
     attempt: u32,
-    cpu_count: u32,
-    memory_bytes: u64,
-    gpu_count: u32,
     timeout_seconds: Option<u64>,
     scratch: std::path::PathBuf,
     completion: Option<TaskCompletion>,
     enforcement_failure: Option<String>,
+    pending_verification: Option<tri::model::Task>,
 }
 
 struct TaskCompletion {
     state: TaskState,
     exit_code: Option<i32>,
     error: Option<String>,
+}
+
+// Keep lease renewal independent of slow systemd, filesystem, and completion work.
+// Pending starts and unacknowledged completions must also retain their leases.
+struct Heartbeats {
+    tasks: Arc<Mutex<HashMap<TaskId, RunningTask>>>,
+    cancellations: watch::Receiver<Vec<TaskId>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl Heartbeats {
+    fn start(node: String) -> Self {
+        let tasks = Arc::new(Mutex::new(HashMap::<TaskId, RunningTask>::new()));
+        let snapshot = tasks.clone();
+        let (cancel_tx, cancellations) = watch::channel(Vec::new());
+        let worker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let running_tasks: Vec<_> = snapshot
+                    .lock()
+                    .expect("heartbeat tasks mutex poisoned")
+                    .values()
+                    .cloned()
+                    .collect();
+                let response = client::tcp(&Request::Heartbeat {
+                    heartbeat: NodeHeartbeat {
+                        name: node.clone(),
+                        cpu_used: running_tasks.iter().map(|task| task.cpu_count).sum(),
+                        memory_used: running_tasks.iter().map(|task| task.memory_bytes).sum(),
+                        gpu_used: running_tasks.iter().map(|task| task.gpu_count).sum(),
+                        running_tasks,
+                    },
+                })
+                .await;
+                match response {
+                    Ok(Response::Heartbeat { cancel }) => {
+                        if cancel_tx.send(cancel).is_err() {
+                            break;
+                        }
+                    }
+                    other => tracing::warn!(?other, "heartbeat failed; retrying"),
+                }
+            }
+        });
+        Self {
+            tasks,
+            cancellations,
+            worker,
+        }
+    }
+
+    fn track(&self, task: &tri::model::Task) {
+        self.tasks
+            .lock()
+            .expect("heartbeat tasks mutex poisoned")
+            .insert(
+                task.id,
+                RunningTask {
+                    id: task.id,
+                    cpu_count: task.spec.requested_cpu,
+                    memory_bytes: task.spec.requested_mem_bytes,
+                    gpu_count: task.spec.requested_gpus,
+                    lease_id: task.lease_id.clone(),
+                },
+            );
+    }
+
+    fn forget(&self, id: TaskId) {
+        self.tasks
+            .lock()
+            .expect("heartbeat tasks mutex poisoned")
+            .remove(&id);
+    }
+}
+
+impl Drop for Heartbeats {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
 }
 
 #[tokio::main]
@@ -183,11 +263,12 @@ async fn main() -> Result<()> {
         sleep(Duration::from_secs(2)).await;
     }
 
+    let heartbeats = Heartbeats::start(node_name.clone());
     let mut running: HashMap<TaskId, LocalTask> = HashMap::new();
-    if let Err(error) = reconcile_units(&node_name, &args.scratch, &mut running).await {
+    if let Err(error) = reconcile_units(&node_name, &args.scratch, &mut running, &heartbeats).await
+    {
         tracing::warn!(%error, "initial task reconciliation failed");
     }
-    let mut next_heartbeat = Instant::now();
     let mut next_registration = Instant::now() + Duration::from_secs(10);
     loop {
         for local in running.values_mut() {
@@ -206,7 +287,28 @@ async fn main() -> Result<()> {
                         }
                     }
                 } else {
-                    local.completion = poll_task(&local.unit, local.timeout_seconds).await?;
+                    match poll_task(&local.unit, local.timeout_seconds).await {
+                        Ok(completion) => {
+                            if completion.is_some()
+                                && let Err(error) = stop_task_unit(&local.unit).await
+                            {
+                                tracing::warn!(task=local.task_id, %error, "task stop not confirmed; retaining allocation");
+                                continue;
+                            }
+                            local.completion = completion;
+                            if local.completion.is_none()
+                                && let Some(task) = local.pending_verification.take()
+                                && let Err(error) = verify_adopted_unit(&local.unit, &task).await
+                            {
+                                local.enforcement_failure = Some(format!(
+                                    "resource enforcement failed during reconciliation: {error:#}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(task = local.task_id, %error, "task inspection failed; retaining allocation and retrying")
+                        }
+                    }
                 }
             }
         }
@@ -238,6 +340,7 @@ async fn main() -> Result<()> {
         }
         for id in acknowledged {
             if let Some(local) = running.remove(&id) {
+                heartbeats.forget(id);
                 if let Err(error) = remove_scratch(&local.scratch) {
                     tracing::warn!(task = id, %error, "failed to remove task scratch directory");
                 }
@@ -255,7 +358,7 @@ async fn main() -> Result<()> {
                 Ok(Response::Ok) => {
                     next_registration = Instant::now() + Duration::from_secs(10);
                     if let Err(error) =
-                        reconcile_units(&node_name, &args.scratch, &mut running).await
+                        reconcile_units(&node_name, &args.scratch, &mut running, &heartbeats).await
                     {
                         tracing::warn!(%error, "task reconciliation failed");
                     }
@@ -271,50 +374,27 @@ async fn main() -> Result<()> {
             }
         }
 
-        if now >= next_heartbeat {
-            let response = client::tcp(&Request::Heartbeat {
-                heartbeat: NodeHeartbeat {
-                    name: node_name.clone(),
-                    cpu_used: running.values().map(|task| task.cpu_count).sum(),
-                    memory_used: running.values().map(|task| task.memory_bytes).sum(),
-                    gpu_used: running.values().map(|task| task.gpu_count).sum(),
-                    running_tasks: running
-                        .values()
-                        .map(|task| RunningTask {
-                            id: task.task_id,
-                            cpu_count: task.cpu_count,
-                            memory_bytes: task.memory_bytes,
-                            gpu_count: task.gpu_count,
-                            lease_id: task.lease_id.clone(),
-                        })
-                        .collect(),
-                },
-            })
-            .await;
-            if let Ok(Response::Heartbeat { cancel }) = response {
-                for id in cancel {
-                    if let Some(local) = running.get_mut(&id)
-                        && local.completion.is_none()
-                    {
-                        match stop_task_unit(&local.unit).await {
-                            Ok(()) => {
-                                // systemctl stop waits for the stop job, including
-                                // KillMode=control-group cleanup. The unit may be
-                                // unloaded immediately afterwards: retain the ack.
-                                local.completion = Some(TaskCompletion {
-                                    state: TaskState::Cancel,
-                                    exit_code: None,
-                                    error: Some("cancel confirmed by node".into()),
-                                });
-                            }
-                            Err(error) => {
-                                tracing::warn!(task = id, %error, "cancel not confirmed; retrying")
-                            }
-                        }
+        let cancel = heartbeats.cancellations.borrow().clone();
+        for id in cancel {
+            if let Some(local) = running.get_mut(&id)
+                && local.completion.is_none()
+            {
+                match stop_task_unit(&local.unit).await {
+                    Ok(()) => {
+                        // systemctl stop waits for the stop job, including
+                        // KillMode=control-group cleanup. The unit may be
+                        // unloaded immediately afterwards: retain the ack.
+                        local.completion = Some(TaskCompletion {
+                            state: TaskState::Cancel,
+                            exit_code: None,
+                            error: Some("cancel confirmed by node".into()),
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(task = id, %error, "cancel not confirmed; retrying")
                     }
                 }
             }
-            next_heartbeat = Instant::now() + Duration::from_secs(2);
         }
 
         if running.len() < args.cpus as usize
@@ -323,6 +403,7 @@ async fn main() -> Result<()> {
             })
             .await
         {
+            heartbeats.track(&assignment.task);
             match spawn_task(
                 &assignment.task,
                 &assignment.cpus,
@@ -335,22 +416,24 @@ async fn main() -> Result<()> {
                 Ok(Some(local)) => {
                     running.insert(assignment.task.id, local);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    heartbeats.forget(assignment.task.id);
+                }
                 Err(error) => {
-                    let scratch =
-                        std::path::Path::new(&args.scratch).join(assignment.task.id.to_string());
-                    let _ = remove_scratch(&scratch);
-                    let _ = client::tcp(&Request::Complete {
-                        result: TaskResult {
-                            id: assignment.task.id,
-                            state: TaskState::Fail,
-                            exit_code: None,
-                            error: Some(error.to_string()),
-                            attempt: assignment.task.attempt,
-                            lease_id: assignment.task.lease_id.clone(),
-                        },
-                    })
-                    .await;
+                    let task = &assignment.task;
+                    let local = LocalTask {
+                        task_id: task.id,
+                        unit: format!("tri-task-{}-{}", task.id, task.attempt),
+                        lease_id: task.lease_id.clone(),
+                        attempt: task.attempt,
+                        timeout_seconds: task.spec.timeout_seconds,
+                        scratch: std::path::Path::new(&args.scratch).join(task.id.to_string()),
+                        completion: None,
+                        enforcement_failure: Some(format!("task startup failed: {error:#}")),
+                        pending_verification: None,
+                    };
+                    // A partially started unit must be stopped before releasing its allocation.
+                    running.insert(task.id, local);
                 }
             }
         }
@@ -659,13 +742,11 @@ async fn spawn_task(
         unit,
         lease_id: task.lease_id.clone(),
         attempt: task.attempt,
-        cpu_count: task.spec.requested_cpu,
-        memory_bytes: task.spec.requested_mem_bytes,
-        gpu_count: task.spec.requested_gpus,
         timeout_seconds: task.spec.timeout_seconds,
         scratch,
         completion: None,
         enforcement_failure: None,
+        pending_verification: None,
     }))
 }
 
@@ -673,6 +754,7 @@ async fn reconcile_units(
     node: &str,
     scratch_root: &str,
     running: &mut HashMap<TaskId, LocalTask>,
+    heartbeats: &Heartbeats,
 ) -> Result<()> {
     let (units, mut stop) = list_task_units().await?;
     let response = client::tcp(&Request::Reconcile {
@@ -688,7 +770,11 @@ async fn reconcile_units(
         anyhow::bail!("unexpected task reconciliation response: {response:?}")
     };
     stop.extend(server_stop);
+    for task in &adopt {
+        heartbeats.track(task);
+    }
     for unit in stop {
+        tracing::warn!(%unit, "reconciliation stopping obsolete or unrecognized task unit");
         if let Err(error) = stop_task_unit(&unit).await {
             tracing::warn!(%error, %unit, "failed to stop orphan task unit");
         }
@@ -698,15 +784,7 @@ async fn reconcile_units(
             continue;
         }
         let unit = format!("tri-task-{}-{}", task.id, task.attempt);
-        let mut local = local_task_from_task(&task, unit.clone(), scratch_root)?;
-        local.completion = poll_task(&unit, task.spec.timeout_seconds).await?;
-        if local.completion.is_none()
-            && let Err(error) = verify_adopted_unit(&unit, &task).await
-        {
-            local.enforcement_failure = Some(format!(
-                "resource enforcement failed during reconciliation: {error:#}"
-            ));
-        }
+        let local = local_task_from_task(&task, unit, scratch_root);
         running.insert(task.id, local);
     }
     Ok(())
@@ -804,26 +882,19 @@ fn parse_task_unit(unit: &str) -> Option<(TaskId, u32)> {
     Some((id.parse().ok()?, attempt.parse().ok()?))
 }
 
-fn local_task_from_task(
-    task: &tri::model::Task,
-    unit: String,
-    scratch_root: &str,
-) -> Result<LocalTask> {
+fn local_task_from_task(task: &tri::model::Task, unit: String, scratch_root: &str) -> LocalTask {
     let scratch = std::path::Path::new(scratch_root).join(task.id.to_string());
-    create_directory(&scratch)?;
-    Ok(LocalTask {
+    LocalTask {
         task_id: task.id,
         unit,
         lease_id: task.lease_id.clone(),
         attempt: task.attempt,
-        cpu_count: task.spec.requested_cpu,
-        memory_bytes: task.spec.requested_mem_bytes,
-        gpu_count: task.spec.requested_gpus,
         timeout_seconds: task.spec.timeout_seconds,
         scratch,
         completion: None,
         enforcement_failure: None,
-    })
+        pending_verification: Some(task.clone()),
+    }
 }
 
 fn parse_resource_set(value: &str) -> Vec<u32> {
@@ -852,39 +923,50 @@ fn standard_device_paths() -> [&'static str; 5] {
 
 async fn poll_task(unit: &str, timeout_seconds: Option<u64>) -> Result<Option<TaskCompletion>> {
     let unit = format!("{unit}.service");
-    let output = systemctl_command()
-        .args([
-            "show",
-            &unit,
-            "-p",
-            "LoadState",
-            "-p",
-            "ActiveState",
-            "-p",
-            "SubState",
-            "-p",
-            "Result",
-            "-p",
-            "ExecMainCode",
-            "-p",
-            "ExecMainStatus",
-        ])
-        .output()
-        .await
-        .with_context(|| format!("checking task service {unit}"))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "systemctl could not inspect task service {unit}: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    let output = timeout(
+        Duration::from_secs(5),
+        systemctl_command()
+            .kill_on_drop(true)
+            .args([
+                "show",
+                &unit,
+                "-p",
+                "LoadState",
+                "-p",
+                "ActiveState",
+                "-p",
+                "SubState",
+                "-p",
+                "Result",
+                "-p",
+                "ExecMainCode",
+                "-p",
+                "ExecMainStatus",
+            ])
+            .output(),
+    )
+    .await
+    .context("task inspection timed out")?
+    .with_context(|| format!("checking task service {unit}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let fields = stdout
         .lines()
         .filter_map(|line| line.split_once('='))
         .collect::<HashMap<_, _>>();
     if fields.get("LoadState") == Some(&"not-found") {
-        anyhow::bail!("task service {unit} disappeared")
+        return Ok(Some(TaskCompletion {
+            state: TaskState::Fail,
+            exit_code: None,
+            error: Some(format!(
+                "task service {unit} disappeared; exit status unavailable"
+            )),
+        }));
     }
+    anyhow::ensure!(
+        output.status.success(),
+        "systemctl could not inspect task service {unit}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     let active = fields.get("ActiveState").copied().unwrap_or_default();
     let sub = fields.get("SubState").copied().unwrap_or_default();
     if active == "activating" || active == "deactivating" || (active == "active" && sub != "exited")
@@ -949,10 +1031,22 @@ async fn stop_task_unit(unit: &str) -> Result<()> {
         .status()
         .await
         .with_context(|| format!("stopping task service {unit}"))?;
-    anyhow::ensure!(
-        status.success(),
-        "systemctl could not stop task service {unit}"
-    );
+    if !status.success() {
+        let missing = timeout(
+            Duration::from_secs(5),
+            systemctl_command()
+                .kill_on_drop(true)
+                .args(["show", &unit, "-p", "LoadState"])
+                .output(),
+        )
+        .await??;
+        anyhow::ensure!(
+            String::from_utf8_lossy(&missing.stdout)
+                .lines()
+                .any(|line| line == "LoadState=not-found"),
+            "systemctl could not stop task service {unit}"
+        );
+    }
     Ok(())
 }
 
